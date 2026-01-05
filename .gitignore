@@ -1,6 +1,7 @@
 log.txt
 state.json
 pdfs
+config.json
 
 # Python-generated files
 __pycache__/

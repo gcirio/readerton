@@ -25,8 +25,6 @@ import requests
 from bs4 import BeautifulSoup
 from weasyprint import CSS, HTML, default_url_fetcher
 
-base_pdf_folder_name = "pdfs"
-
 # Optional HTTP client/session configuration
 _HTTP_HEADERS = {"User-Agent": "readerton-pdf/1.0 (+https://example.com)"}
 _REQUEST_TIMEOUT = 20  # seconds
@@ -54,13 +52,33 @@ console_handler.setFormatter(console_formatter)
 logger.addHandler(file_handler)
 logger.addHandler(console_handler)
 
-# Feeds to process
-FEEDS = {
-    "wheres_your_ed": "https://www.wheresyoured.at/feed",
-    "the_pragmatic_engineer_blog": "https://feeds.feedburner.com/ThePragmaticEngineer",
-    "the_pragmatic_engineer_newsletter": "https://newsletter.pragmaticengineer.com/feed",
-    # add more feeds as desired
-}
+
+def load_config() -> dict:
+    """Load configuration from config.json file."""
+    config_file = "config.json"
+    try:
+        with open(config_file, "r") as f:
+            config = json.load(f)
+            logger.info("Loaded configuration from %s", config_file)
+            return config
+    except FileNotFoundError:
+        logger.error(
+            "Configuration file %s not found. Please create it with 'feeds' and 'base_pdf_folder_name' keys.",
+            config_file,
+        )
+        raise
+    except json.JSONDecodeError as e:
+        logger.error("Error parsing %s: %s", config_file, e)
+        raise
+
+
+# Load configuration
+config = load_config()
+FEEDS = config.get("feeds", {})
+base_pdf_folder_name = config.get("base_pdf_folder_name", "pdfs")
+
+if not FEEDS:
+    logger.warning("No feeds configured in config.json")
 
 
 def safe_filename(title: Optional[str], maxlen: int = 80) -> str:
