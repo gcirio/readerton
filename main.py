@@ -15,6 +15,7 @@ import json
 import logging
 import os
 import re
+from datetime import datetime
 from typing import Optional, Tuple
 from urllib.parse import urlparse
 
@@ -31,16 +32,33 @@ _REQUEST_TIMEOUT = 20  # seconds
 # Optional AWS S3 client - keep but commented usage by default
 s3 = boto3.client("s3")
 
-
-# Configure logger
-logging.basicConfig(filename="log.txt", level="DEBUG")
+# Configure logger with different levels for file and console
 logger = logging.getLogger("readerton")
+logger.setLevel(logging.DEBUG)
+
+# File handler - DEBUG level
+file_handler = logging.FileHandler("log.txt")
+file_handler.setLevel(logging.DEBUG)
+file_formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+file_handler.setFormatter(file_formatter)
+
+# Console handler - INFO level
+console_handler = logging.StreamHandler()
+console_handler.setLevel(logging.INFO)
+console_formatter = logging.Formatter("%(message)s")
+console_handler.setFormatter(console_formatter)
+
+# Add handlers to logger
+logger.addHandler(file_handler)
+logger.addHandler(console_handler)
 
 # Feeds to process
-FEEDS = [
-    "https://www.wheresyoured.at/feed",
+FEEDS = {
+    "wheres_your_ed": "https://www.wheresyoured.at/feed",
+    "the_pragmatic_engineer_blog": "https://feeds.feedburner.com/ThePragmaticEngineer",
+    "the_pragmatic_engineer_newsletter": "https://newsletter.pragmaticengineer.com/feed",
     # add more feeds as desired
-]
+}
 
 
 def safe_filename(title: Optional[str], maxlen: int = 80) -> str:
@@ -88,10 +106,11 @@ def extract_main_html(
 
 def render_pdf_weasy(
     content_html: str, filename: str, base_url: Optional[str] = None
-) -> bool:
+) -> Tuple[bool, int]:
     """
     Render PDF using WeasyPrint from HTML string.
     base_url should be set so relative assets (images/CSS) are resolvable.
+    Returns (success, page_count).
     """
     try:
         # Add a small default CSS for nicer text
@@ -103,17 +122,20 @@ def render_pdf_weasy(
         """
         )
         # HTML(...) accepts string and base_url for relative resources
-        HTML(string=content_html, base_url=base_url).write_pdf(
-            filename, stylesheets=[css] if css else None
-        )
-        logger.info("Generated PDF: %s", filename)
-        return True
+        html_obj = HTML(string=content_html, base_url=base_url)
+        doc = html_obj.render(stylesheets=[css] if css else None)
+        page_count = len(doc.pages)
+        doc.write_pdf(filename)
+        logger.debug("Generated PDF: %s (%d pages)", filename, page_count)
+        return True, page_count
     except Exception as exc:
         logger.warning("Failed to render PDF %s: %s", filename, exc)
-        return False
+        return False, 0
 
 
-def generate_pdf_from_url(url: str, filename: str, title: Optional[str] = None) -> bool:
+def generate_pdf_from_url(
+    url: str, filename: str, title: Optional[str] = None
+) -> Tuple[bool, int]:
     """
     Generate a PDF from a URL without using a browser backend.
 
@@ -122,6 +144,8 @@ def generate_pdf_from_url(url: str, filename: str, title: Optional[str] = None) 
       2. Extract main content (readability)
       3. Render with WeasyPrint
       4. If rendering fails, log and skip
+
+    Returns (success, page_count).
     """
     html_text, final_url = fetch_html(url)
     base_url = final_url or url
@@ -129,18 +153,35 @@ def generate_pdf_from_url(url: str, filename: str, title: Optional[str] = None) 
     if html_text:
         content_html, extracted_title = extract_main_html(html_text, base_url=base_url)
         # Pass sanitized/cleaned HTML to WeasyPrint
-        if render_pdf_weasy(content_html, filename, base_url=base_url):
-            return True
+        success, page_count = render_pdf_weasy(
+            content_html, filename, base_url=base_url
+        )
+        if success:
+            return True, page_count
         else:
             logger.error(
                 "WeasyPrint failed to render PDF for %s and no fallback is configured.",
                 filename,
             )
-            return False
+            return False, 0
 
     # No HTML fetched; cannot generate PDF
     logger.error("No HTML fetched for %s; cannot generate PDF.", url)
-    return False
+    return False, 0
+
+
+def generate_index():
+    # List all books in the bucket and create a dead-simple HTML list
+    objs = s3.list_objects_v2(Bucket=bucket_name, Prefix="books/")
+    links = [
+        f'<li><a href="{obj["Key"]}">{obj["Key"]}</a></li>'
+        for obj in objs.get("Contents", [])
+    ]
+    html = f"<html><body><h1>My Daily Reads</h1><ul>{''.join(links)}</ul></body></html>"
+
+    s3.put_object(
+        Bucket=bucket_name, Key="index.html", Body=html, ContentType="text/html"
+    )
 
 
 def process_feeds():
@@ -158,9 +199,14 @@ def process_feeds():
     except Exception:
         pass
 
-    for feed_url in FEEDS:
-        logger.info("Processing feed: %s", feed_url)
+    for feed_name, feed_url in FEEDS.items():
+        logger.info("Processing feed: %s (%s)", feed_name, feed_url)
         feed = feedparser.parse(feed_url)
+
+        # Create subfolder using feed name
+        domain_folder = os.path.abspath(f"./{feed_name}")
+        os.makedirs(domain_folder, exist_ok=True)
+
         for entry in feed.entries:
             entry_id = getattr(entry, "id", None) or getattr(entry, "link", None)
 
@@ -170,7 +216,7 @@ def process_feeds():
                 or entry_id
             )
             link = getattr(entry, "link", None)
-            logger.info("Entry: %s (%s)", title, link)
+            logger.debug("Entry: %s (%s)", title, link)
 
             if not link:
                 logger.warning("Skipping entry without link: %s", title)
@@ -181,33 +227,65 @@ def process_feeds():
                 logger.debug("Already processed entry: %s", entry_id)
                 continue
 
+            # Get the published date if available
+            date_str = ""
+            if hasattr(entry, "published_parsed") and entry.published_parsed:
+                date_obj = datetime(*entry.published_parsed[:6])
+                date_str = date_obj.strftime("%Y-%m-%d")
+            elif hasattr(entry, "updated_parsed") and entry.updated_parsed:
+                date_obj = datetime(*entry.updated_parsed[:6])
+                date_str = date_obj.strftime("%Y-%m-%d")
+            else:
+                date_str = datetime.now().strftime("%Y-%m-%d")
+
             filename_base = safe_filename(title)
             if not filename_base:
                 parsed = urlparse(link)
                 filename_base = (parsed.netloc + parsed.path).replace("/", "_")
-            filename = os.path.abspath(
-                f"./{filename_base[:80].strip().replace(' ', '_')}.pdf"
+
+            # Create temporary filename without page count
+            temp_filename = os.path.join(
+                domain_folder,
+                f"temp_{filename_base[:60].strip().replace(' ', '_')}.pdf",
             )
 
             # Generate PDF
             try:
-                ok = generate_pdf_from_url(link, filename, title)
+                ok, page_count = generate_pdf_from_url(link, temp_filename, title)
                 if not ok:
                     logger.error("Failed to generate PDF for %s", link)
                     continue
+
+                # Rename file to include date and page count
+                final_filename = os.path.join(
+                    domain_folder,
+                    f"{date_str}_{page_count}p_{filename_base[:60].strip().replace(' ', '_')}.pdf",
+                )
+                os.rename(temp_filename, final_filename)
+                logger.info(
+                    "New PDF: %s",
+                    f"{domain_folder}/{os.path.basename(final_filename)}",
+                )
+
             except Exception as exc:
                 logger.exception(
                     "Unexpected error generating PDF for %s: %s", link, exc
                 )
+                # Clean up temp file if it exists
+                if os.path.exists(temp_filename):
+                    try:
+                        os.remove(temp_filename)
+                    except:
+                        pass
                 continue
 
             # Optional: upload to S3 and update seen state
             # if s3:
             #     try:
-            #         s3.upload_file(filename, bucket_name, f"books/{os.path.basename(filename)}")
-            #         logger.info("Uploaded PDF to S3: %s", filename)
+            #         s3.upload_file(final_filename, bucket_name, f"books/{feed_name}/{os.path.basename(final_filename)}")
+            #         logger.info("Uploaded PDF to S3: %s", final_filename)
             #     except Exception as exc:
-            #         logger.warning("Failed to upload %s to S3: %s", filename, exc)
+            #         logger.warning("Failed to upload %s to S3: %s", final_filename, exc)
             #
 
             seen_ids.add(entry_id)

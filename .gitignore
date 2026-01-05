@@ -1,3 +1,6 @@
+log.txt
+state.json
+
 # Python-generated files
 __pycache__/
 *.py[oc]
