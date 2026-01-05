@@ -409,18 +409,201 @@ def generate_pdf_from_url(
     return False, 0
 
 
-def generate_index():
-    # List all books in the bucket and create a dead-simple HTML list
-    objs = s3.list_objects_v2(Bucket=bucket_name, Prefix="books/")
-    links = [
-        f'<li><a href="{obj["Key"]}">{obj["Key"]}</a></li>'
-        for obj in objs.get("Contents", [])
-    ]
-    html = f"<html><body><h1>My Daily Reads</h1><ul>{''.join(links)}</ul></body></html>"
+def generate_html_index():
+    """
+    Generate a static HTML index page with links to all PDFs, organized by feed and sorted by date.
+    Compatible with older browsers (Android 6).
+    """
+    # Collect all PDFs organized by feed
+    pdf_data = {}
 
-    s3.put_object(
-        Bucket=bucket_name, Key="index.html", Body=html, ContentType="text/html"
-    )
+    # Scan directories in the base PDF folder
+    base_folder = os.path.abspath(f"./{base_pdf_folder_name}")
+    if not os.path.exists(base_folder):
+        logger.warning("Base PDF folder does not exist: %s", base_folder)
+        return
+
+    # Get all subdirectories (feed folders)
+    feed_names = [
+        d
+        for d in os.listdir(base_folder)
+        if os.path.isdir(os.path.join(base_folder, d))
+    ]
+
+    for feed_name in feed_names:
+        domain_folder = os.path.join(base_folder, feed_name)
+
+        pdf_files = []
+        for filename in os.listdir(domain_folder):
+            if filename.endswith(".pdf"):
+                filepath = os.path.join(domain_folder, filename)
+
+                # Extract date from filename (format: YYYY-MM-DD_...)
+                date_match = re.match(r"(\d{4}-\d{2}-\d{2})", filename)
+                date_str = date_match.group(1) if date_match else "1970-01-01"
+
+                # Extract page count (format: ..._{X}p_...)
+                page_match = re.search(r"_(\d+)p_", filename)
+                page_count = page_match.group(1) if page_match else "?"
+
+                # Get file size
+                file_size = os.path.getsize(filepath)
+                size_mb = file_size / (1024 * 1024)
+
+                # Extract title (everything after date and page count)
+                title = filename
+                title = re.sub(r"^\d{4}-\d{2}-\d{2}_\d+p_", "", title)
+                title = title.replace(".pdf", "").replace("_", " ")
+
+                pdf_files.append(
+                    {
+                        "filename": filename,
+                        "title": title,
+                        "date": date_str,
+                        "page_count": page_count,
+                        "size_mb": size_mb,
+                        "relative_path": f"{feed_name}/{filename}",
+                    }
+                )
+
+        # Sort by date (newest first)
+        pdf_files.sort(key=lambda x: x["date"], reverse=True)
+        pdf_data[feed_name] = pdf_files
+
+    # Generate HTML
+    html_content = """<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Readerton - PDF Archive</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 900px;
+            margin: 20px auto;
+            padding: 0 15px;
+            background-color: #f5f5f5;
+            color: #333;
+        }
+        h1 {
+            color: #2c3e50;
+            border-bottom: 3px solid #3498db;
+            padding-bottom: 10px;
+        }
+        h2 {
+            color: #34495e;
+            margin-top: 30px;
+            border-bottom: 2px solid #95a5a6;
+            padding-bottom: 5px;
+        }
+        .feed-section {
+            background: white;
+            padding: 15px;
+            margin-bottom: 20px;
+            border-radius: 5px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        .pdf-list {
+            list-style: none;
+            padding: 0;
+        }
+        .pdf-item {
+            padding: 10px;
+            margin: 5px 0;
+            border-left: 4px solid #3498db;
+            background-color: #ecf0f1;
+        }
+        .pdf-item:hover {
+            background-color: #d5dbdb;
+        }
+        .pdf-link {
+            color: #2980b9;
+            text-decoration: none;
+            font-weight: bold;
+            font-size: 1.1em;
+        }
+        .pdf-link:hover {
+            text-decoration: underline;
+        }
+        .pdf-meta {
+            color: #7f8c8d;
+            font-size: 0.9em;
+            margin-top: 5px;
+        }
+        .date {
+            font-weight: bold;
+            color: #555;
+        }
+        .stats {
+            background: #3498db;
+            color: white;
+            padding: 15px;
+            border-radius: 5px;
+            margin-bottom: 20px;
+        }
+        .footer {
+            text-align: center;
+            margin-top: 40px;
+            padding: 20px;
+            color: #7f8c8d;
+            font-size: 0.9em;
+        }
+    </style>
+</head>
+<body>
+    <h1>Readerton PDF Archive</h1>
+"""
+
+    # Add statistics
+    total_pdfs = sum(len(pdfs) for pdfs in pdf_data.values())
+    total_sources = len([f for f in pdf_data.values() if f])
+
+    html_content += f"""    <div class="stats">
+        <strong>Total PDFs:</strong> {total_pdfs} | <strong>Sources:</strong> {total_sources}
+    </div>
+"""
+
+    # Add each feed section
+    for feed_name, pdf_files in sorted(pdf_data.items()):
+        if not pdf_files:
+            continue
+
+        html_content += f"""    <div class="feed-section">
+        <h2>{feed_name}</h2>
+        <ul class="pdf-list">
+"""
+
+        for pdf in pdf_files:
+            html_content += f"""            <li class="pdf-item">
+                <a href="{pdf["relative_path"]}" class="pdf-link">{pdf["title"]}</a>
+                <div class="pdf-meta">
+                    <span class="date">{pdf["date"]}</span> |
+                    {pdf["page_count"]} pages |
+                    {pdf["size_mb"]:.2f} MB
+                </div>
+            </li>
+"""
+
+        html_content += """        </ul>
+    </div>
+"""
+
+    # Add footer
+    current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    html_content += f"""    <div class="footer">
+        Generated on {current_time}
+    </div>
+</body>
+</html>
+"""
+
+    # Write HTML file
+    index_path = os.path.join(base_pdf_folder_name, "index.html")
+    with open(index_path, "w", encoding="utf-8") as f:
+        f.write(html_content)
+
+    logger.info("Generated HTML index: %s", index_path)
 
 
 def process_feeds():
@@ -540,6 +723,7 @@ def process_feeds():
 
 def main():
     process_feeds()
+    generate_html_index()
 
 
 if __name__ == "__main__":
