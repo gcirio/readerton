@@ -481,7 +481,7 @@ def generate_html_index():
     <style>
         body {
             font-family: Arial, sans-serif;
-            max-width: 900px;
+            max-width: 1400px;
             margin: 20px auto;
             padding: 0 15px;
             background-color: #f5f5f5;
@@ -508,12 +508,20 @@ def generate_html_index():
         .pdf-list {
             list-style: none;
             padding: 0;
+            column-count: 2;
+            column-gap: 15px;
+        }
+        @media (max-width: 768px) {
+            .pdf-list {
+                column-count: 1;
+            }
         }
         .pdf-item {
             padding: 10px;
-            margin: 5px 0;
             border-left: 4px solid #3498db;
             background-color: #ecf0f1;
+            break-inside: avoid;
+            margin-bottom: 10px;
         }
         .pdf-item:hover {
             background-color: #d5dbdb;
