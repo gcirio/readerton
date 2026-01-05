@@ -22,8 +22,10 @@ from urllib.parse import urlparse
 import boto3
 import feedparser
 import requests
-from readability import Document
-from weasyprint import CSS, HTML
+from bs4 import BeautifulSoup
+from weasyprint import CSS, HTML, default_url_fetcher
+
+base_pdf_folder_name = "pdfs"
 
 # Optional HTTP client/session configuration
 _HTTP_HEADERS = {"User-Agent": "readerton-pdf/1.0 (+https://example.com)"}
@@ -82,26 +84,242 @@ def fetch_html(url: str, timeout: int = _REQUEST_TIMEOUT) -> Tuple[Optional[str]
         return None, url
 
 
+def custom_url_fetcher(url):
+    """
+    Custom URL fetcher for WeasyPrint to fetch resources (images, CSS, etc.)
+    with proper headers and timeout settings.
+    """
+    try:
+        logger.debug("Fetching resource: %s", url)
+        response = requests.get(url, headers=_HTTP_HEADERS, timeout=_REQUEST_TIMEOUT)
+        response.raise_for_status()
+        return {
+            "string": response.content,
+            "mime_type": response.headers.get(
+                "Content-Type", "application/octet-stream"
+            ),
+            "encoding": response.encoding,
+            "redirected_url": response.url,
+        }
+    except Exception as exc:
+        logger.debug("Failed to fetch resource %s: %s", url, exc)
+        # Fall back to default fetcher
+        return default_url_fetcher(url)
+
+
+def preprocess_html_for_images(html: str) -> str:
+    """
+    Preprocess HTML to fix lazy-loaded images.
+    Converts data-src and similar attributes to src, and extracts images from noscript tags.
+    """
+    try:
+        soup = BeautifulSoup(html, "html.parser")
+
+        # Fix lazy-loaded images - convert data-src to src
+        lazy_attrs = ["data-src", "data-lazy-src", "data-original", "data-fallback-src"]
+        for img in soup.find_all("img"):
+            # If img has a lazy loading attribute but no src or a placeholder src
+            for attr in lazy_attrs:
+                if img.get(attr):
+                    actual_src = img.get(attr)
+                    current_src = img.get("src", "")
+                    # Replace if no src or if src looks like a placeholder
+                    if (
+                        not current_src
+                        or "placeholder" in current_src.lower()
+                        or "data:image" in current_src
+                    ):
+                        img["src"] = actual_src
+                        logger.debug("Converted %s to src: %s", attr, actual_src)
+                        break
+
+        # Extract images from noscript tags (common in Substack and similar platforms)
+        for noscript in soup.find_all("noscript"):
+            noscript_content = noscript.string or ""
+            if noscript_content:
+                # Parse the content inside noscript
+                noscript_soup = BeautifulSoup(noscript_content, "html.parser")
+                for img in noscript_soup.find_all("img"):
+                    # Insert the image before the noscript tag
+                    noscript.insert_before(img)
+                    logger.debug(
+                        "Extracted image from noscript: %s", img.get("src", "")
+                    )
+
+        return str(soup)
+    except Exception as exc:
+        logger.debug("HTML preprocessing failed: %s", exc)
+        return html
+
+
 def extract_main_html(
     html: str, base_url: Optional[str] = None
 ) -> Tuple[str, Optional[str]]:
     """
-    Extract the main article HTML and a title.
+    Extract the main article HTML and a title using BeautifulSoup.
     Returns (html_string, title_or_None).
     """
+    # Preprocess HTML to fix lazy-loaded images
+    html = preprocess_html_for_images(html)
 
     try:
-        doc = Document(html)
-        summary = doc.summary()
-        title = doc.short_title()
-        if summary and summary.strip():
-            logger.debug("Extracted article via readability with title: %s", title)
-            return summary, title
-    except Exception as exc:
-        logger.debug("readability.Document extraction failed: %s", exc)
+        soup = BeautifulSoup(html, "html.parser")
 
-    logger.debug("readability.Document extraction failed")
-    return "", ""
+        # Extract title
+        title = None
+        title_tag = soup.find("title")
+        if title_tag:
+            title = title_tag.get_text().strip()
+
+        # Look for Open Graph title as fallback
+        if not title:
+            og_title = soup.find("meta", property="og:title")
+            if og_title:
+                title = og_title.get("content", "").strip()
+
+        logger.debug("Extracted title: %s", title)
+
+        # Try to find the main content using common selectors
+        content = None
+
+        # Try common article containers in order of specificity
+        selectors = [
+            ("article", {}),
+            ("main", {}),
+            ("[role='main']", {}),
+            (
+                "div",
+                {
+                    "class": lambda x: x
+                    and any(
+                        cls in str(x).lower()
+                        for cls in [
+                            "post-content",
+                            "article-content",
+                            "entry-content",
+                            "content-body",
+                            "post-body",
+                        ]
+                    )
+                },
+            ),
+            (
+                "div",
+                {
+                    "id": lambda x: x
+                    and any(
+                        id_part in str(x).lower()
+                        for id_part in ["content", "article", "post", "main"]
+                    )
+                },
+            ),
+        ]
+
+        for tag, attrs in selectors:
+            if attrs:
+                content = soup.find(tag, attrs)
+            else:
+                content = soup.find(tag)
+
+            if content:
+                logger.debug("Found content using selector: %s %s", tag, attrs)
+                break
+
+        # If no specific content area found, use the body
+        if not content:
+            content = soup.find("body")
+            logger.debug("No specific content area found, using body")
+
+        if not content:
+            logger.warning("Could not find any content container")
+            return "", title
+
+        # Remove common unwanted elements
+        unwanted_selectors = [
+            "nav",
+            "header",
+            "footer",
+            "aside",
+            {
+                "class": lambda x: x
+                and any(
+                    cls in str(x).lower()
+                    for cls in [
+                        "sidebar",
+                        "navigation",
+                        "nav",
+                        "menu",
+                        "comment",
+                        "ad",
+                        "advertisement",
+                    ]
+                )
+            },
+            {
+                "id": lambda x: x
+                and any(
+                    id_part in str(x).lower()
+                    for id_part in [
+                        "sidebar",
+                        "navigation",
+                        "nav",
+                        "menu",
+                        "comment",
+                        "ad",
+                    ]
+                )
+            },
+        ]
+
+        for selector in unwanted_selectors:
+            if isinstance(selector, str):
+                for elem in content.find_all(selector):
+                    elem.decompose()
+            else:
+                for elem in content.find_all(attrs=selector):
+                    elem.decompose()
+
+        # Remove image control buttons/overlays (zoom, expand, refresh icons)
+        image_control_selectors = [
+            "button",
+            {
+                "class": lambda x: x
+                and any(
+                    cls in str(x).lower()
+                    for cls in [
+                        "zoom",
+                        "expand",
+                        "fullscreen",
+                        "image-button",
+                        "image-control",
+                        "image-action",
+                        "lightbox",
+                    ]
+                )
+            },
+            {"role": lambda x: x and "button" in str(x).lower()},
+        ]
+
+        for selector in image_control_selectors:
+            if isinstance(selector, str):
+                # Remove buttons that are siblings or parents of images
+                for elem in content.find_all(selector):
+                    # Check if this button is near an image
+                    parent = elem.parent
+                    if parent and (parent.find("img") or elem.find("img")):
+                        elem.decompose()
+            else:
+                for elem in content.find_all(attrs=selector):
+                    # Check if this element is near an image
+                    parent = elem.parent
+                    if parent and (parent.find("img") or elem.find("img")):
+                        elem.decompose()
+
+        return str(content), title
+
+    except Exception as exc:
+        logger.warning("Content extraction failed: %s", exc)
+        return "", None
 
 
 def render_pdf_weasy(
@@ -122,7 +340,10 @@ def render_pdf_weasy(
         """
         )
         # HTML(...) accepts string and base_url for relative resources
-        html_obj = HTML(string=content_html, base_url=base_url)
+        # Use custom URL fetcher to fetch images with proper headers
+        html_obj = HTML(
+            string=content_html, base_url=base_url, url_fetcher=custom_url_fetcher
+        )
         doc = html_obj.render(stylesheets=[css] if css else None)
         page_count = len(doc.pages)
         doc.write_pdf(filename)
@@ -204,7 +425,7 @@ def process_feeds():
         feed = feedparser.parse(feed_url)
 
         # Create subfolder using feed name
-        domain_folder = os.path.abspath(f"./{feed_name}")
+        domain_folder = os.path.abspath(f"./{base_pdf_folder_name}/{feed_name}")
         os.makedirs(domain_folder, exist_ok=True)
 
         for entry in feed.entries:
