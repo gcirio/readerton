@@ -508,32 +508,26 @@ def generate_html_index():
         .pdf-list {
             list-style: none;
             padding: 0;
-            column-count: 2;
-            column-gap: 15px;
-        }
-        @media (max-width: 768px) {
-            .pdf-list {
-                column-count: 1;
-            }
+            overflow: hidden;
         }
         .pdf-item {
             padding: 10px;
             border-left: 4px solid #3498db;
             background-color: #ecf0f1;
-            break-inside: avoid;
             margin-bottom: 10px;
+            float: left;
+            width: 48%;
+            margin-right: 2%;
+            box-sizing: border-box;
         }
-        .pdf-item:hover {
-            background-color: #d5dbdb;
+        .pdf-item:nth-child(2n) {
+            margin-right: 0;
         }
         .pdf-link {
             color: #2980b9;
             text-decoration: none;
             font-weight: bold;
             font-size: 1.1em;
-        }
-        .pdf-link:hover {
-            text-decoration: underline;
         }
         .pdf-meta {
             color: #7f8c8d;
@@ -583,8 +577,28 @@ def generate_html_index():
         <ul class="pdf-list">
 """
 
-        for pdf in pdf_files:
+        # Split items into two columns (column-wise distribution)
+        mid_point = (len(pdf_files) + 1) // 2
+        left_column = pdf_files[:mid_point]
+        right_column = pdf_files[mid_point:]
+
+        # Interleave items from both columns
+        for i in range(mid_point):
+            # Add left column item
+            pdf = left_column[i]
             html_content += f"""            <li class="pdf-item">
+                <a href="{pdf["relative_path"]}" class="pdf-link">{pdf["title"]}</a>
+                <div class="pdf-meta">
+                    <span class="date">{pdf["date"]}</span> |
+                    {pdf["page_count"]} pages |
+                    {pdf["size_mb"]:.2f} MB
+                </div>
+            </li>
+"""
+            # Add right column item if it exists
+            if i < len(right_column):
+                pdf = right_column[i]
+                html_content += f"""            <li class="pdf-item">
                 <a href="{pdf["relative_path"]}" class="pdf-link">{pdf["title"]}</a>
                 <div class="pdf-meta">
                     <span class="date">{pdf["date"]}</span> |
