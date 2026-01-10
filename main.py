@@ -2,32 +2,35 @@
 """
 readerton/main.py
 
-PDF generation from RSS feeds
+Static HTML generation from RSS feeds
 
-Uses WeasyPrint - renders HTML/CSS without a full browser
-Uses readability to extract the main article content (clean HTML)
-=> Won't work if text is page is generated via javascript?
+Uses readability/BeautifulSoup to extract the main article content (clean HTML)
+Generates simple static HTML pages compatible with Android 4 browsers
+=> Won't work if text in page is generated via javascript?
 """
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import os
 import re
 from datetime import datetime
 from typing import Optional, Tuple
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 import boto3
 import feedparser
 import requests
 from bs4 import BeautifulSoup
-from weasyprint import CSS, HTML, default_url_fetcher
 
 # Optional HTTP client/session configuration
-_HTTP_HEADERS = {"User-Agent": "readerton-pdf/1.0 (+https://example.com)"}
+_HTTP_HEADERS = {"User-Agent": "readerton/1.0 (+https://example.com)"}
 _REQUEST_TIMEOUT = 20  # seconds
+
+# articles with less than 100 words are probably due to a paywall
+MIN_NB_WORDS = 100
 
 # Optional AWS S3 client - keep but commented usage by default
 s3 = boto3.client("s3")
@@ -63,7 +66,7 @@ def load_config() -> dict:
             return config
     except FileNotFoundError:
         logger.error(
-            "Configuration file %s not found. Please create it with 'feeds' and 'base_pdf_folder_name' keys.",
+            "Configuration file %s not found. Please create it with 'feeds' and 'base_html_folder_name' keys.",
             config_file,
         )
         raise
@@ -75,7 +78,9 @@ def load_config() -> dict:
 # Load configuration
 config = load_config()
 FEEDS = config.get("feeds", {})
-base_pdf_folder_name = config.get("base_pdf_folder_name", "pdfs")
+base_html_folder_name = config.get(
+    "base_html_folder_name", config.get("base_pdf_folder_name", "articles")
+)
 
 if not FEEDS:
     logger.warning("No feeds configured in config.json")
@@ -102,27 +107,21 @@ def fetch_html(url: str, timeout: int = _REQUEST_TIMEOUT) -> Tuple[Optional[str]
         return None, url
 
 
-def custom_url_fetcher(url):
-    """
-    Custom URL fetcher for WeasyPrint to fetch resources (images, CSS, etc.)
-    with proper headers and timeout settings.
-    """
+def fetch_image_as_data_uri(url: str, timeout: int = _REQUEST_TIMEOUT) -> Optional[str]:
+    """Fetch an image and convert it to a data URI for embedding."""
     try:
-        logger.debug("Fetching resource: %s", url)
-        response = requests.get(url, headers=_HTTP_HEADERS, timeout=_REQUEST_TIMEOUT)
+        logger.debug("Fetching image: %s", url)
+        response = requests.get(url, headers=_HTTP_HEADERS, timeout=timeout)
         response.raise_for_status()
-        return {
-            "string": response.content,
-            "mime_type": response.headers.get(
-                "Content-Type", "application/octet-stream"
-            ),
-            "encoding": response.encoding,
-            "redirected_url": response.url,
-        }
+        content_type = response.headers.get("Content-Type", "image/jpeg")
+        # Ensure content type is an image type
+        if not content_type.startswith("image/"):
+            content_type = "image/jpeg"
+        encoded = base64.b64encode(response.content).decode("ascii")
+        return f"data:{content_type};base64,{encoded}"
     except Exception as exc:
-        logger.debug("Failed to fetch resource %s: %s", url, exc)
-        # Fall back to default fetcher
-        return default_url_fetcher(url)
+        logger.debug("Failed to fetch image %s: %s", url, exc)
+        return None
 
 
 def preprocess_html_for_images(html: str) -> str:
@@ -258,6 +257,10 @@ def extract_main_html(
             "header",
             "footer",
             "aside",
+            "script",
+            "style",
+            "noscript",
+            "iframe",
             {
                 "class": lambda x: x
                 and any(
@@ -270,6 +273,9 @@ def extract_main_html(
                         "comment",
                         "ad",
                         "advertisement",
+                        "social",
+                        "share",
+                        "related",
                     ]
                 )
             },
@@ -340,87 +346,316 @@ def extract_main_html(
         return "", None
 
 
-def render_pdf_weasy(
-    content_html: str, filename: str, base_url: Optional[str] = None
-) -> Tuple[bool, int]:
+def embed_images_in_html(content_html: str, base_url: Optional[str] = None) -> str:
     """
-    Render PDF using WeasyPrint from HTML string.
-    base_url should be set so relative assets (images/CSS) are resolvable.
-    Returns (success, page_count).
+    Embed images directly in HTML as data URIs for offline viewing.
     """
     try:
-        # Add a small default CSS for nicer text
-        css = CSS(
-            string="""
-            @page { size: A4; margin: 1in; }
-            body { font-family: serif; font-size: 12pt; line-height: 1.4; }
-            img { max-width: 100%; height: auto; }
-        """
-        )
-        # HTML(...) accepts string and base_url for relative resources
-        # Use custom URL fetcher to fetch images with proper headers
-        html_obj = HTML(
-            string=content_html, base_url=base_url, url_fetcher=custom_url_fetcher
-        )
-        doc = html_obj.render(stylesheets=[css] if css else None)
-        page_count = len(doc.pages)
-        doc.write_pdf(filename)
-        logger.debug("Generated PDF: %s (%d pages)", filename, page_count)
-        return True, page_count
+        soup = BeautifulSoup(content_html, "html.parser")
+
+        for img in soup.find_all("img"):
+            src = img.get("src")
+            if not src:
+                continue
+
+            # Ensure src is a string
+            src_str = str(src) if not isinstance(src, str) else src
+
+            # Skip already embedded images
+            if src_str.startswith("data:"):
+                continue
+
+            # Resolve relative URLs
+            if base_url and not src_str.startswith(("http://", "https://")):
+                src_str = urljoin(base_url, src_str)
+
+            # Fetch and embed the image
+            data_uri = fetch_image_as_data_uri(src_str)
+            if data_uri:
+                img["src"] = data_uri
+                logger.debug("Embedded image: %s", src_str[:50])
+            else:
+                # Keep original src as fallback
+                logger.debug("Could not embed image, keeping original: %s", src_str)
+
+        return str(soup)
     except Exception as exc:
-        logger.warning("Failed to render PDF %s: %s", filename, exc)
+        logger.warning("Image embedding failed: %s", exc)
+        return content_html
+
+
+def render_static_html(
+    content_html: str,
+    filename: str,
+    title: Optional[str] = None,
+    source_url: Optional[str] = None,
+    base_url: Optional[str] = None,
+) -> Tuple[bool, int]:
+    """
+    Render a static HTML page from content HTML.
+    Compatible with Android 4 browsers (uses simple CSS, no modern features).
+    Returns (success, word_count).
+    """
+    try:
+        # Embed images as data URIs
+        content_html = embed_images_in_html(content_html, base_url)
+
+        # Count words for metadata
+        soup = BeautifulSoup(content_html, "html.parser")
+        text_content = soup.get_text()
+        word_count = len(text_content.split())
+
+        # skip if less than MIN_NB_WORDS words (it's probably a paid article!)
+        if word_count < MIN_NB_WORDS:
+            return True, 0
+
+        # Escape title for HTML
+        safe_title = (
+            (title or "Article")
+            .replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+        )
+
+        # Build the full HTML page with Android 4 compatible CSS
+        # Using simple CSS that works in Android 4's WebKit browser:
+        # - No flexbox, grid, or CSS variables
+        # - No modern selectors
+        # - Basic font stack
+        # - Simple colors and sizing
+        html_page = f"""<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=2.0, user-scalable=yes">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+    <title>{safe_title}</title>
+    <style type="text/css">
+        * {{
+            -webkit-box-sizing: border-box;
+            box-sizing: border-box;
+        }}
+        html {{
+            font-size: 120%;
+        }}
+        body {{
+            font-family: Georgia, "Times New Roman", Times, serif;
+            font-size: 18px;
+            line-height: 1.6;
+            color: #333;
+            background-color: #fff;
+            margin: 0;
+            padding: 15px;
+            max-width: 1200px;
+            margin-left: auto;
+            margin-right: auto;
+        }}
+        h1, h2, h3, h4, h5, h6 {{
+            font-family: Arial, Helvetica, sans-serif;
+            line-height: 1.3;
+            color: #222;
+            margin-top: 1.2em;
+            margin-bottom: 0.6em;
+        }}
+        h1 {{
+            font-size: 1.6em;
+            border-bottom: 2px solid #333;
+            padding-bottom: 0.3em;
+        }}
+        h2 {{
+            font-size: 1.4em;
+        }}
+        h3 {{
+            font-size: 1.2em;
+        }}
+        p {{
+            margin: 0 0 1em 0;
+            text-align: left;
+        }}
+        a {{
+            color: #0066cc;
+            text-decoration: underline;
+        }}
+        a:visited {{
+            color: #551a8b;
+        }}
+        img {{
+            max-width: 100%;
+            height: auto;
+            display: block;
+            margin: 1em auto;
+            border: 1px solid #ddd;
+        }}
+        figure {{
+            margin: 1em 0;
+            padding: 0;
+        }}
+        figcaption {{
+            font-size: 0.9em;
+            color: #666;
+            text-align: center;
+            margin-top: 0.5em;
+        }}
+        blockquote {{
+            margin: 1em 0;
+            padding: 0.5em 1em;
+            border-left: 4px solid #ccc;
+            background-color: #f9f9f9;
+            font-style: italic;
+        }}
+        pre, code {{
+            font-family: "Courier New", Courier, monospace;
+            background-color: #f4f4f4;
+            border: 1px solid #ddd;
+        }}
+        pre {{
+            padding: 10px;
+            overflow: auto;
+            white-space: pre-wrap;
+            word-wrap: break-word;
+        }}
+        code {{
+            padding: 2px 4px;
+            font-size: 0.9em;
+        }}
+        pre code {{
+            padding: 0;
+            border: none;
+            background: none;
+        }}
+        ul, ol {{
+            margin: 1em 0;
+            padding-left: 2em;
+        }}
+        li {{
+            margin-bottom: 0.5em;
+        }}
+        table {{
+            border-collapse: collapse;
+            width: 100%;
+            margin: 1em 0;
+        }}
+        th, td {{
+            border: 1px solid #ccc;
+            padding: 8px;
+            text-align: left;
+        }}
+        th {{
+            background-color: #f4f4f4;
+        }}
+        hr {{
+            border: none;
+            border-top: 1px solid #ccc;
+            margin: 2em 0;
+        }}
+        .article-header {{
+            margin-bottom: 1.5em;
+            padding-bottom: 1em;
+            border-bottom: 1px solid #eee;
+        }}
+        .article-title {{
+            margin-top: 0;
+            margin-bottom: 0.5em;
+        }}
+        .article-meta {{
+            font-size: 0.85em;
+            color: #666;
+        }}
+        .article-meta a {{
+            color: #666;
+        }}
+        .article-content {{
+            margin-top: 1em;
+        }}
+        .back-link {{
+            display: block;
+            margin-top: 2em;
+            padding-top: 1em;
+            border-top: 1px solid #eee;
+            font-size: 0.9em;
+        }}
+    </style>
+</head>
+<body>
+    <div class="article-header">
+        <h1 class="article-title">{safe_title}</h1>
+        <div class="article-meta">
+            {f'<a href="{source_url}">Original source</a> | ' if source_url else ""}{word_count} words
+        </div>
+    </div>
+    <div class="article-content">
+        {content_html}
+    </div>
+    <div class="back-link">
+        <a href="../index.html">&larr; Back to index</a>
+    </div>
+</body>
+</html>
+"""
+
+        # Write the HTML file
+        with open(filename, "w", encoding="utf-8") as f:
+            f.write(html_page)
+
+        logger.debug("Generated HTML: %s (%d words)", filename, word_count)
+        return True, word_count
+    except Exception as exc:
+        logger.warning("Failed to render HTML %s: %s", filename, exc)
         return False, 0
 
 
-def generate_pdf_from_url(
+def generate_html_from_url(
     url: str, filename: str, title: Optional[str] = None
 ) -> Tuple[bool, int]:
     """
-    Generate a PDF from a URL without using a browser backend.
+    Generate a static HTML page from a URL.
 
     Strategy:
       1. Fetch HTML (requests)
-      2. Extract main content (readability)
-      3. Render with WeasyPrint
+      2. Extract main content (BeautifulSoup)
+      3. Render as simple static HTML
       4. If rendering fails, log and skip
 
-    Returns (success, page_count).
+    Returns (success, word_count).
     """
     html_text, final_url = fetch_html(url)
     base_url = final_url or url
 
     if html_text:
         content_html, extracted_title = extract_main_html(html_text, base_url=base_url)
-        # Pass sanitized/cleaned HTML to WeasyPrint
-        success, page_count = render_pdf_weasy(
-            content_html, filename, base_url=base_url
+        # Use extracted title if no title provided
+        if not title and extracted_title:
+            title = extracted_title
+        # Pass sanitized/cleaned HTML to renderer
+        success, word_count = render_static_html(
+            content_html, filename, title=title, source_url=url, base_url=base_url
         )
         if success:
-            return True, page_count
+            return True, word_count
         else:
             logger.error(
-                "WeasyPrint failed to render PDF for %s and no fallback is configured.",
+                "Failed to render HTML for %s.",
                 filename,
             )
             return False, 0
 
-    # No HTML fetched; cannot generate PDF
-    logger.error("No HTML fetched for %s; cannot generate PDF.", url)
+    # No HTML fetched; cannot generate page
+    logger.error("No HTML fetched for %s; cannot generate page.", url)
     return False, 0
 
 
 def generate_html_index():
     """
-    Generate a static HTML index page with links to all PDFs, organized by feed and sorted by date.
-    Compatible with older browsers (Android 6).
+    Generate a static HTML index page with links to all articles, organized by feed and sorted by date.
+    Compatible with older browsers (Android 4).
     """
-    # Collect all PDFs organized by feed
-    pdf_data = {}
+    # Collect all articles organized by feed
+    article_data = {}
 
-    # Scan directories in the base PDF folder
-    base_folder = os.path.abspath(f"./{base_pdf_folder_name}")
+    # Scan directories in the base folder
+    base_folder = os.path.abspath(f"./{base_html_folder_name}")
     if not os.path.exists(base_folder):
-        logger.warning("Base PDF folder does not exist: %s", base_folder)
+        logger.warning("Base folder does not exist: %s", base_folder)
         return
 
     # Get all subdirectories (feed folders)
@@ -433,44 +668,44 @@ def generate_html_index():
     for feed_name in feed_names:
         domain_folder = os.path.join(base_folder, feed_name)
 
-        pdf_files = []
+        article_files = []
         for filename in os.listdir(domain_folder):
-            if filename.endswith(".pdf"):
+            if filename.endswith(".html") and filename != "index.html":
                 filepath = os.path.join(domain_folder, filename)
 
                 # Extract date from filename (format: YYYY-MM-DD_...)
                 date_match = re.match(r"(\d{4}-\d{2}-\d{2})", filename)
                 date_str = date_match.group(1) if date_match else "1970-01-01"
 
-                # Extract page count (format: ..._{X}p_...)
-                page_match = re.search(r"_(\d+)p_", filename)
-                page_count = page_match.group(1) if page_match else "?"
+                # Extract word count (format: ..._{X}w_...)
+                word_match = re.search(r"_(\d+)w_", filename)
+                word_count = word_match.group(1) if word_match else "?"
 
                 # Get file size
                 file_size = os.path.getsize(filepath)
-                size_mb = file_size / (1024 * 1024)
+                size_kb = file_size / 1024
 
-                # Extract title (everything after date and page count)
+                # Extract title (everything after date and word count)
                 title = filename
-                title = re.sub(r"^\d{4}-\d{2}-\d{2}_\d+p_", "", title)
-                title = title.replace(".pdf", "").replace("_", " ")
+                title = re.sub(r"^\d{4}-\d{2}-\d{2}_\d+w_", "", title)
+                title = title.replace(".html", "").replace("_", " ")
 
-                pdf_files.append(
+                article_files.append(
                     {
                         "filename": filename,
                         "title": title,
                         "date": date_str,
-                        "page_count": page_count,
-                        "size_mb": size_mb,
+                        "word_count": word_count,
+                        "size_kb": size_kb,
                         "relative_path": f"{feed_name}/{filename}",
                     }
                 )
 
         # Sort by date (newest first)
-        pdf_files.sort(key=lambda x: x["date"], reverse=True)
-        pdf_data[feed_name] = pdf_files
+        article_files.sort(key=lambda x: x["date"], reverse=True)
+        article_data[feed_name] = article_files
 
-    # Generate HTML
+    # Generate HTML with Android 4 compatible CSS
     html_content = """<!DOCTYPE html>
 <html>
 <head>
@@ -478,7 +713,11 @@ def generate_html_index():
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <meta name="robots" content="noindex, nofollow">
     <title>Readerton - PDF Archive</title>
-    <style>
+    <style type="text/css">
+        * {{
+            -webkit-box-sizing: border-box;
+            box-sizing: border-box;
+        }}
         body {
             font-family: Arial, sans-serif;
             max-width: 1400px;
@@ -505,12 +744,12 @@ def generate_html_index():
             border-radius: 5px;
             box-shadow: 0 2px 4px rgba(0,0,0,0.1);
         }
-        .pdf-list {
+        .article-list {
             list-style: none;
             padding: 0;
             overflow: hidden;
         }
-        .pdf-item {
+        .article-item {
             padding: 10px;
             border-left: 4px solid #3498db;
             background-color: #ecf0f1;
@@ -523,13 +762,13 @@ def generate_html_index():
         .pdf-item:nth-child(2n) {
             margin-right: 0;
         }
-        .pdf-link {
+        .article-link {
             color: #2980b9;
             text-decoration: none;
             font-weight: bold;
             font-size: 1.1em;
         }
-        .pdf-meta {
+        .article-meta {
             color: #7f8c8d;
             font-size: 0.9em;
             margin-top: 5px;
@@ -555,55 +794,55 @@ def generate_html_index():
     </style>
 </head>
 <body>
-    <h1>Readerton PDF Archive</h1>
+    <h1>Readerton Article Archive</h1>
 """
 
     # Add statistics
-    total_pdfs = sum(len(pdfs) for pdfs in pdf_data.values())
-    total_sources = len([f for f in pdf_data.values() if f])
+    total_articles = sum(len(articles) for articles in article_data.values())
+    total_sources = len([f for f in article_data.values() if f])
 
     html_content += f"""    <div class="stats">
-        <strong>Total PDFs:</strong> {total_pdfs} | <strong>Sources:</strong> {total_sources}
+        <strong>Total Articles:</strong> {total_articles} | <strong>Sources:</strong> {total_sources}
     </div>
 """
 
     # Add each feed section
-    for feed_name, pdf_files in sorted(pdf_data.items()):
-        if not pdf_files:
+    for feed_name, article_files in sorted(article_data.items()):
+        if not article_files:
             continue
 
         html_content += f"""    <div class="feed-section">
         <h2>{feed_name}</h2>
-        <ul class="pdf-list">
+        <ul class="article-list">
 """
 
         # Split items into two columns (column-wise distribution)
-        mid_point = (len(pdf_files) + 1) // 2
-        left_column = pdf_files[:mid_point]
-        right_column = pdf_files[mid_point:]
+        mid_point = (len(article_files) + 1) // 2
+        left_column = article_files[:mid_point]
+        right_column = article_files[mid_point:]
 
         # Interleave items from both columns
         for i in range(mid_point):
             # Add left column item
-            pdf = left_column[i]
-            html_content += f"""            <li class="pdf-item">
-                <a href="{pdf["relative_path"]}" class="pdf-link">{pdf["title"]}</a>
-                <div class="pdf-meta">
-                    <span class="date">{pdf["date"]}</span> |
-                    {pdf["page_count"]} pages |
-                    {pdf["size_mb"]:.2f} MB
+            article = left_column[i]
+            html_content += f"""            <li class="article-item">
+                <a href="{article["relative_path"]}" class="article-link">{article["title"]}</a>
+                <div class="article-meta">
+                    <span class="date">{article["date"]}</span> |
+                    {article["word_count"]} words |
+                    {article["size_kb"]:.1f} KB
                 </div>
             </li>
 """
             # Add right column item if it exists
             if i < len(right_column):
-                pdf = right_column[i]
-                html_content += f"""            <li class="pdf-item">
-                <a href="{pdf["relative_path"]}" class="pdf-link">{pdf["title"]}</a>
-                <div class="pdf-meta">
-                    <span class="date">{pdf["date"]}</span> |
-                    {pdf["page_count"]} pages |
-                    {pdf["size_mb"]:.2f} MB
+                article = right_column[i]
+                html_content += f"""            <li class="article-item">
+                <a href="{article["relative_path"]}" class="article-link">{article["title"]}</a>
+                <div class="article-meta">
+                    <span class="date">{article["date"]}</span> |
+                    {article["word_count"]} words |
+                    {article["size_kb"]:.1f} KB
                 </div>
             </li>
 """
@@ -622,7 +861,7 @@ def generate_html_index():
 """
 
     # Write HTML file
-    index_path = os.path.join(base_pdf_folder_name, "index.html")
+    index_path = os.path.join(base_html_folder_name, "index.html")
     with open(index_path, "w", encoding="utf-8") as f:
         f.write(html_content)
 
@@ -631,16 +870,17 @@ def generate_html_index():
 
 def process_feeds():
     """
-    Main loop: parse feeds, check state, generate PDFs for new entries, update state
+    Main loop: parse feeds, check state, generate HTML pages for new entries, update state
     S3 upload is optional and commented by default.
     """
     # State tracking (uncomment and configure S3 or a local file as preferred)
-    seen_ids = set()
+    seen_ids_old = set()
+    seen_ids_new = set()
     try:
         # state_obj = s3.get_object(Bucket=bucket_name, Key="state.json")
-        # seen_ids = set(json.loads(state_obj["Body"].read().decode()))
+        # seen_ids_old = set(json.loads(state_obj["Body"].read().decode()))
         with open("state.json", "r") as state_file:
-            seen_ids = set(json.load(state_file))
+            seen_ids_old = set(json.load(state_file))
     except Exception:
         pass
 
@@ -649,7 +889,7 @@ def process_feeds():
         feed = feedparser.parse(feed_url)
 
         # Create subfolder using feed name
-        domain_folder = os.path.abspath(f"./{base_pdf_folder_name}/{feed_name}")
+        domain_folder = os.path.abspath(f"./{base_html_folder_name}/{feed_name}")
         os.makedirs(domain_folder, exist_ok=True)
 
         for entry in feed.entries:
@@ -668,7 +908,7 @@ def process_feeds():
                 continue
 
             # If using state tracking, skip seen items
-            if entry_id in seen_ids:
+            if entry_id in seen_ids_old:
                 logger.debug("Already processed entry: %s", entry_id)
                 continue
 
@@ -688,33 +928,40 @@ def process_feeds():
                 parsed = urlparse(link)
                 filename_base = (parsed.netloc + parsed.path).replace("/", "_")
 
-            # Create temporary filename without page count
+            # Create temporary filename without word count
             temp_filename = os.path.join(
                 domain_folder,
-                f"temp_{filename_base[:60].strip().replace(' ', '_')}.pdf",
+                f"temp_{filename_base[:60].strip().replace(' ', '_')}.html",
             )
 
-            # Generate PDF
+            seen_ids_new.add(entry_id)
+
+            # Generate HTML page
             try:
-                ok, page_count = generate_pdf_from_url(link, temp_filename, title)
+                ok, word_count = generate_html_from_url(link, temp_filename, title)
                 if not ok:
-                    logger.error("Failed to generate PDF for %s", link)
+                    logger.error("Failed to generate HTML for %s", link)
+                    continue
+                if ok and word_count == 0:
+                    logger.info(
+                        f"Skipped article (less than {MIN_NB_WORDS} words): {link}"
+                    )
                     continue
 
-                # Rename file to include date and page count
+                # Rename file to include date and word count
                 final_filename = os.path.join(
                     domain_folder,
-                    f"{date_str}_{page_count}p_{filename_base[:60].strip().replace(' ', '_')}.pdf",
+                    f"{date_str}_{word_count}w_{filename_base[:60].strip().replace(' ', '_')}.html",
                 )
                 os.rename(temp_filename, final_filename)
                 logger.info(
-                    "New PDF: %s",
+                    "New article: %s",
                     f"{domain_folder}/{os.path.basename(final_filename)}",
                 )
 
             except Exception as exc:
                 logger.exception(
-                    "Unexpected error generating PDF for %s: %s", link, exc
+                    "Unexpected error generating HTML for %s: %s", link, exc
                 )
                 # Clean up temp file if it exists
                 if os.path.exists(temp_filename):
@@ -727,19 +974,17 @@ def process_feeds():
             # Optional: upload to S3 and update seen state
             # if s3:
             #     try:
-            #         s3.upload_file(final_filename, bucket_name, f"books/{feed_name}/{os.path.basename(final_filename)}")
-            #         logger.info("Uploaded PDF to S3: %s", final_filename)
+            #         s3.upload_file(final_filename, bucket_name, f"articles/{feed_name}/{os.path.basename(final_filename)}")
+            #         logger.info("Uploaded article to S3: %s", final_filename)
             #     except Exception as exc:
             #         logger.warning("Failed to upload %s to S3: %s", final_filename, exc)
             #
-
-            seen_ids.add(entry_id)
 
     # persist state back
     try:
         # s3.put_object(Bucket=bucket_name, Key="state.json", Body=json.dumps(list(seen_ids)))
         with open("state.json", "w") as state_file:
-            json.dump(list(seen_ids), state_file)
+            json.dump(list(seen_ids_new), state_file)
     except Exception:
         pass
 
