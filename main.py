@@ -470,15 +470,19 @@ def render_static_html(
         * {{
             -webkit-box-sizing: border-box;
             box-sizing: border-box;
+            -webkit-text-stroke: 0;
+            -webkit-font-smoothing: antialiased;
         }}
         html {{
             font-size: 100%;
         }}
         body {{
-            font-family: serif;
+            font-family: Georgia, "Times New Roman", Times, serif;
             font-size: 20px;
-            line-height: 1.6;
-            color: #333;
+            font-weight: 400;
+            line-height: 1.55;
+            letter-spacing: 0.01em;
+            color: #222;
             background-color: #fff;
             margin: 0;
             padding: 15px;
@@ -486,8 +490,17 @@ def render_static_html(
             margin-left: auto;
             margin-right: auto;
         }}
+        /* Prevent faux bold on all text elements */
+        body, p, div, span, li, td, th, blockquote, figcaption {{
+            font-weight: 400 !important;
+            -webkit-text-stroke: 0 !important;
+        }}
+        b, strong {{
+            font-weight: 400;
+        }}
         h1, h2, h3, h4, h5, h6 {{
             font-family: Arial, Helvetica, sans-serif;
+            font-weight: 700;
             line-height: 1.3;
             color: #222;
             margin-top: 1.2em;
