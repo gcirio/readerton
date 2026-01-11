@@ -252,6 +252,71 @@ def extract_main_html(
             return "", title
 
         # Remove common unwanted elements
+        # Helper function to check if any class matches unwanted patterns
+        # Only matches if the pattern is at the start or end of the class name
+        # (e.g., "sidebar", "sidebar-widget", "left-sidebar" but NOT "main-content-and-sidebar-xyz")
+        def _class_matches_unwanted(class_attr, unwanted_list):
+            if not class_attr:
+                return False
+            # class_attr is a list of class names
+            for class_name in class_attr:
+                class_lower = class_name.lower()
+                for unwanted in unwanted_list:
+                    # Check for exact match
+                    if class_lower == unwanted:
+                        return True
+                    # Check if it starts with "unwanted-" or ends with "-unwanted"
+                    if class_lower.startswith(unwanted + "-") or class_lower.endswith(
+                        "-" + unwanted
+                    ):
+                        return True
+                    # Also check underscore variants
+                    if class_lower.startswith(unwanted + "_") or class_lower.endswith(
+                        "_" + unwanted
+                    ):
+                        return True
+            return False
+
+        def _id_matches_unwanted(id_attr, unwanted_list):
+            if not id_attr:
+                return False
+            id_lower = id_attr.lower()
+            for unwanted in unwanted_list:
+                if id_lower == unwanted:
+                    return True
+                if id_lower.startswith(unwanted + "-") or id_lower.endswith(
+                    "-" + unwanted
+                ):
+                    return True
+                if id_lower.startswith(unwanted + "_") or id_lower.endswith(
+                    "_" + unwanted
+                ):
+                    return True
+            return False
+
+        unwanted_class_patterns = [
+            "sidebar",
+            "navigation",
+            "nav",
+            "menu",
+            "comment",
+            "ad",
+            "advertisement",
+            "social",
+            "share",
+            "related",
+            "email",
+        ]
+
+        unwanted_id_patterns = [
+            "sidebar",
+            "navigation",
+            "nav",
+            "menu",
+            "comment",
+            "ad",
+        ]
+
         unwanted_selectors = [
             "nav",
             "header",
@@ -261,38 +326,9 @@ def extract_main_html(
             "style",
             "noscript",
             "iframe",
-            {
-                "class": lambda x: x
-                and any(
-                    cls in str(x).lower()
-                    for cls in [
-                        "sidebar",
-                        "navigation",
-                        "nav",
-                        "menu",
-                        "comment",
-                        "ad",
-                        "advertisement",
-                        "social",
-                        "share",
-                        "related",
-                    ]
-                )
-            },
-            {
-                "id": lambda x: x
-                and any(
-                    id_part in str(x).lower()
-                    for id_part in [
-                        "sidebar",
-                        "navigation",
-                        "nav",
-                        "menu",
-                        "comment",
-                        "ad",
-                    ]
-                )
-            },
+            "button",
+            {"class": lambda x: _class_matches_unwanted(x, unwanted_class_patterns)},
+            {"id": lambda x: _id_matches_unwanted(x, unwanted_id_patterns)},
         ]
 
         for selector in unwanted_selectors:
@@ -436,11 +472,11 @@ def render_static_html(
             box-sizing: border-box;
         }}
         html {{
-            font-size: 120%;
+            font-size: 100%;
         }}
         body {{
-            font-family: Georgia, "Times New Roman", Times, serif;
-            font-size: 18px;
+            font-family: serif;
+            font-size: 20px;
             line-height: 1.6;
             color: #333;
             background-color: #fff;
@@ -879,7 +915,7 @@ def process_feeds():
     try:
         # state_obj = s3.get_object(Bucket=bucket_name, Key="state.json")
         # seen_ids_old = set(json.loads(state_obj["Body"].read().decode()))
-        with open("state.json", "r") as state_file:
+        with open(f"{base_html_folder_name}/state.json", "r") as state_file:
             seen_ids_old = set(json.load(state_file))
     except Exception:
         pass
@@ -983,7 +1019,7 @@ def process_feeds():
     # persist state back
     try:
         # s3.put_object(Bucket=bucket_name, Key="state.json", Body=json.dumps(list(seen_ids)))
-        with open("state.json", "w") as state_file:
+        with open(f"{base_html_folder_name}/state.json", "w") as state_file:
             json.dump(list(seen_ids_new), state_file)
     except Exception:
         pass
