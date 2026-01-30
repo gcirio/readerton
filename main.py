@@ -1032,8 +1032,10 @@ def process_feeds():
     # persist state back
     try:
         # s3.put_object(Bucket=bucket_name, Key="state.json", Body=json.dumps(list(seen_ids)))
+        # Merge previously seen IDs with newly seen IDs to avoid forgetting old entries
+        seen_ids_all = seen_ids_old | seen_ids_new
         with open(f"{base_html_folder_name}/state.json", "w") as state_file:
-            json.dump(list(seen_ids_new), state_file)
+            json.dump(list(seen_ids_all), state_file)
     except Exception:
         pass
 
