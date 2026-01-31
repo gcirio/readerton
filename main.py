@@ -436,8 +436,26 @@ def render_static_html(
         # Embed images as data URIs
         content_html = embed_images_in_html(content_html, base_url)
 
-        # Count words for metadata
+        # Remove duplicated top-level title from the extracted article body.
+        # Some sources (eg Substack) include an <h1> inside the content; we already render our own header title.
         soup = BeautifulSoup(content_html, "html.parser")
+        if title:
+            normalized_title = " ".join(title.split()).strip().lower()
+        else:
+            normalized_title = ""
+
+        if normalized_title:
+            first_h1 = soup.find("h1")
+            if first_h1:
+                h1_text = (
+                    " ".join(first_h1.get_text(" ", strip=True).split()).strip().lower()
+                )
+                if h1_text == normalized_title:
+                    first_h1.decompose()
+
+        content_html = str(soup)
+
+        # Count words for metadata (after title de-duplication)
         text_content = soup.get_text()
         word_count = len(text_content.split())
 
@@ -627,10 +645,10 @@ def render_static_html(
 </head>
 <body>
     <div class="article-header">
-        <h1 class="article-title">{safe_title}</h1>
         <div class="article-meta">
-            {f'<a href="{source_url}">Original source</a> | ' if source_url else ""}{word_count} words
+            {word_count} words{f' | <a href="{source_url}">Original source</a>' if source_url else ""}
         </div>
+        <h1 class="article-title">{safe_title}</h1>
     </div>
     <div class="article-content">
         {content_html}
