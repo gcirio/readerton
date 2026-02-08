@@ -2,11 +2,11 @@
 """
 readerton/main.py
 
-Static HTML generation from RSS feeds
+HTML generation from RSS feeds.
 
-Uses readability/BeautifulSoup to extract the main article content (clean HTML)
-Generates simple static HTML pages compatible with Android 4 browsers
-=> Won't work if text in page is generated via javascript?
+Uses BeautifulSoup to extract the main article content (clean HTML).
+Generates simple static HTML pages compatible with Android 4 browsers.
+Can be used standalone (local) or as a library from the Modal web app.
 """
 
 from __future__ import annotations
@@ -20,70 +20,54 @@ from datetime import datetime
 from typing import Optional, Tuple
 from urllib.parse import urljoin, urlparse
 
-import boto3
 import feedparser
 import requests
 from bs4 import BeautifulSoup
 
-# Optional HTTP client/session configuration
+# HTTP configuration
 _HTTP_HEADERS = {"User-Agent": "readerton/1.0 (+https://example.com)"}
 _REQUEST_TIMEOUT = 20  # seconds
 
-# articles with less than 100 words are probably due to a paywall
+# Articles with fewer than 100 words are probably paywalled
 MIN_NB_WORDS = 100
 
-# Optional AWS S3 client - keep but commented usage by default
-s3 = boto3.client("s3")
-
-# Configure logger with different levels for file and console
 logger = logging.getLogger("readerton")
-logger.setLevel(logging.DEBUG)
-
-# File handler - DEBUG level
-file_handler = logging.FileHandler("log.txt")
-file_handler.setLevel(logging.DEBUG)
-file_formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
-file_handler.setFormatter(file_formatter)
-
-# Console handler - INFO level
-console_handler = logging.StreamHandler()
-console_handler.setLevel(logging.INFO)
-console_formatter = logging.Formatter("%(message)s")
-console_handler.setFormatter(console_formatter)
-
-# Add handlers to logger
-logger.addHandler(file_handler)
-logger.addHandler(console_handler)
 
 
-def load_config() -> dict:
-    """Load configuration from config.json file."""
-    config_file = "config.json"
+def setup_logging(log_file: Optional[str] = "log.txt") -> None:
+    """Configure logger with different levels for file and console."""
+    logger.setLevel(logging.DEBUG)
+    # Clear existing handlers to avoid duplicates on repeat calls
+    logger.handlers.clear()
+
+    if log_file:
+        fh = logging.FileHandler(log_file)
+        fh.setLevel(logging.DEBUG)
+        fh.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
+        logger.addHandler(fh)
+
+    ch = logging.StreamHandler()
+    ch.setLevel(logging.INFO)
+    ch.setFormatter(logging.Formatter("%(message)s"))
+    logger.addHandler(ch)
+
+
+def load_config(config_path: str = "config.json") -> dict:
+    """Load configuration from a JSON file."""
     try:
-        with open(config_file, "r") as f:
+        with open(config_path, "r") as f:
             config = json.load(f)
-            logger.info("Loaded configuration from %s", config_file)
+            logger.info("Loaded configuration from %s", config_path)
             return config
     except FileNotFoundError:
         logger.error(
             "Configuration file %s not found. Please create it with 'feeds' and 'base_html_folder_name' keys.",
-            config_file,
+            config_path,
         )
         raise
     except json.JSONDecodeError as e:
-        logger.error("Error parsing %s: %s", config_file, e)
+        logger.error("Error parsing %s: %s", config_path, e)
         raise
-
-
-# Load configuration
-config = load_config()
-FEEDS = config.get("feeds", {})
-base_html_folder_name = config.get(
-    "base_html_folder_name", config.get("base_pdf_folder_name", "articles")
-)
-
-if not FEEDS:
-    logger.warning("No feeds configured in config.json")
 
 
 def safe_filename(title: Optional[str], maxlen: int = 80) -> str:
@@ -207,26 +191,30 @@ def extract_main_html(
             (
                 "div",
                 {
-                    "class": lambda x: x
-                    and any(
-                        cls in str(x).lower()
-                        for cls in [
-                            "post-content",
-                            "article-content",
-                            "entry-content",
-                            "content-body",
-                            "post-body",
-                        ]
+                    "class": lambda x: (
+                        x
+                        and any(
+                            cls in str(x).lower()
+                            for cls in [
+                                "post-content",
+                                "article-content",
+                                "entry-content",
+                                "content-body",
+                                "post-body",
+                            ]
+                        )
                     )
                 },
             ),
             (
                 "div",
                 {
-                    "id": lambda x: x
-                    and any(
-                        id_part in str(x).lower()
-                        for id_part in ["content", "article", "post", "main"]
+                    "id": lambda x: (
+                        x
+                        and any(
+                            id_part in str(x).lower()
+                            for id_part in ["content", "article", "post", "main"]
+                        )
                     )
                 },
             ),
@@ -252,25 +240,18 @@ def extract_main_html(
             return "", title
 
         # Remove common unwanted elements
-        # Helper function to check if any class matches unwanted patterns
-        # Only matches if the pattern is at the start or end of the class name
-        # (e.g., "sidebar", "sidebar-widget", "left-sidebar" but NOT "main-content-and-sidebar-xyz")
         def _class_matches_unwanted(class_attr, unwanted_list):
             if not class_attr:
                 return False
-            # class_attr is a list of class names
             for class_name in class_attr:
                 class_lower = class_name.lower()
                 for unwanted in unwanted_list:
-                    # Check for exact match
                     if class_lower == unwanted:
                         return True
-                    # Check if it starts with "unwanted-" or ends with "-unwanted"
                     if class_lower.startswith(unwanted + "-") or class_lower.endswith(
                         "-" + unwanted
                     ):
                         return True
-                    # Also check underscore variants
                     if class_lower.startswith(unwanted + "_") or class_lower.endswith(
                         "_" + unwanted
                     ):
@@ -343,18 +324,20 @@ def extract_main_html(
         image_control_selectors = [
             "button",
             {
-                "class": lambda x: x
-                and any(
-                    cls in str(x).lower()
-                    for cls in [
-                        "zoom",
-                        "expand",
-                        "fullscreen",
-                        "image-button",
-                        "image-control",
-                        "image-action",
-                        "lightbox",
-                    ]
+                "class": lambda x: (
+                    x
+                    and any(
+                        cls in str(x).lower()
+                        for cls in [
+                            "zoom",
+                            "expand",
+                            "fullscreen",
+                            "image-button",
+                            "image-control",
+                            "image-action",
+                            "lightbox",
+                        ]
+                    )
                 )
             },
             {"role": lambda x: x and "button" in str(x).lower()},
@@ -362,15 +345,12 @@ def extract_main_html(
 
         for selector in image_control_selectors:
             if isinstance(selector, str):
-                # Remove buttons that are siblings or parents of images
                 for elem in content.find_all(selector):
-                    # Check if this button is near an image
                     parent = elem.parent
                     if parent and (parent.find("img") or elem.find("img")):
                         elem.decompose()
             else:
                 for elem in content.find_all(attrs=selector):
-                    # Check if this element is near an image
                     parent = elem.parent
                     if parent and (parent.find("img") or elem.find("img")):
                         elem.decompose()
@@ -426,6 +406,7 @@ def render_static_html(
     title: Optional[str] = None,
     source_url: Optional[str] = None,
     base_url: Optional[str] = None,
+    index_url: str = "../index.html",
 ) -> Tuple[bool, int]:
     """
     Render a static HTML page from content HTML.
@@ -437,7 +418,6 @@ def render_static_html(
         content_html = embed_images_in_html(content_html, base_url)
 
         # Remove duplicated top-level title from the extracted article body.
-        # Some sources (eg Substack) include an <h1> inside the content; we already render our own header title.
         soup = BeautifulSoup(content_html, "html.parser")
         if title:
             normalized_title = " ".join(title.split()).strip().lower()
@@ -472,11 +452,6 @@ def render_static_html(
         )
 
         # Build the full HTML page with Android 4 compatible CSS
-        # Using simple CSS that works in Android 4's WebKit browser:
-        # - No flexbox, grid, or CSS variables
-        # - No modern selectors
-        # - Basic font stack
-        # - Simple colors and sizing
         html_page = f"""<!DOCTYPE html>
 <html>
 <head>
@@ -654,7 +629,7 @@ def render_static_html(
         {content_html}
     </div>
     <div class="back-link">
-        <a href="../index.html">&larr; Back to index</a>
+        <a href="{index_url}">&larr; Back to index</a>
     </div>
 </body>
 </html>
@@ -672,7 +647,10 @@ def render_static_html(
 
 
 def generate_html_from_url(
-    url: str, filename: str, title: Optional[str] = None
+    url: str,
+    filename: str,
+    title: Optional[str] = None,
+    index_url: str = "../index.html",
 ) -> Tuple[bool, int]:
     """
     Generate a static HTML page from a URL.
@@ -695,7 +673,12 @@ def generate_html_from_url(
             title = extracted_title
         # Pass sanitized/cleaned HTML to renderer
         success, word_count = render_static_html(
-            content_html, filename, title=title, source_url=url, base_url=base_url
+            content_html,
+            filename,
+            title=title,
+            source_url=url,
+            base_url=base_url,
+            index_url=index_url,
         )
         if success:
             return True, word_count
@@ -711,31 +694,42 @@ def generate_html_from_url(
     return False, 0
 
 
-def generate_html_index():
+def generate_html_index(base_folder: str = "articles", url_prefix: str = "") -> None:
     """
-    Generate a static HTML index page with links to all articles, organized by feed and sorted by date.
-    Compatible with older browsers (Android 4).
+    Generate a static HTML index page with links to all articles, organized by
+    feed and sorted by date.  Compatible with older browsers (Android 4).
+
+    Includes a form with an Update Feeds button and per-article checkboxes for
+    removal.  The form POSTs to ``/update``.
+
+    Parameters
+    ----------
+    base_folder:
+        Absolute or relative path to the articles root directory.
+    url_prefix:
+        String prepended to article hrefs.  Use ``""`` when the index lives
+        inside *base_folder* (local mode) and ``"articles/"`` when the index
+        is served at ``/`` (Modal mode).
     """
     # Collect all articles organized by feed
-    article_data = {}
+    article_data: dict[str, list[dict]] = {}
 
-    # Scan directories in the base folder
-    base_folder = os.path.abspath(f"./{base_html_folder_name}")
-    if not os.path.exists(base_folder):
-        logger.warning("Base folder does not exist: %s", base_folder)
+    base_folder_abs = os.path.abspath(base_folder)
+    if not os.path.exists(base_folder_abs):
+        logger.warning("Base folder does not exist: %s", base_folder_abs)
         return
 
     # Get all subdirectories (feed folders)
     feed_names = [
         d
-        for d in os.listdir(base_folder)
-        if os.path.isdir(os.path.join(base_folder, d))
+        for d in os.listdir(base_folder_abs)
+        if os.path.isdir(os.path.join(base_folder_abs, d))
     ]
 
     for feed_name in feed_names:
-        domain_folder = os.path.join(base_folder, feed_name)
+        domain_folder = os.path.join(base_folder_abs, feed_name)
+        article_files: list[dict] = []
 
-        article_files = []
         for filename in os.listdir(domain_folder):
             if filename.endswith(".html") and filename != "index.html":
                 filepath = os.path.join(domain_folder, filename)
@@ -753,14 +747,14 @@ def generate_html_index():
                 size_kb = file_size / 1024
 
                 # Extract title (everything after date and word count)
-                title = filename
-                title = re.sub(r"^\d{4}-\d{2}-\d{2}_\d+w_", "", title)
-                title = title.replace(".html", "").replace("_", " ")
+                display_title = filename
+                display_title = re.sub(r"^\d{4}-\d{2}-\d{2}_\d+w_", "", display_title)
+                display_title = display_title.replace(".html", "").replace("_", " ")
 
                 article_files.append(
                     {
                         "filename": filename,
-                        "title": title,
+                        "title": display_title,
                         "date": date_str,
                         "word_count": word_count,
                         "size_kb": size_kb,
@@ -772,21 +766,29 @@ def generate_html_index():
         article_files.sort(key=lambda x: x["date"], reverse=True)
         article_data[feed_name] = article_files
 
-    # Generate HTML with Android 4 compatible CSS
-    html_content = """<!DOCTYPE html>
+    # -------------------------------------------------------------------
+    # Build HTML
+    # -------------------------------------------------------------------
+    total_articles = sum(len(arts) for arts in article_data.values())
+    total_sources = len([f for f in article_data.values() if f])
+
+    parts: list[str] = []
+
+    # ----- Head & CSS (plain string – no f-string brace escaping needed) -----
+    parts.append("""<!DOCTYPE html>
 <html>
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <meta name="robots" content="noindex, nofollow">
-    <title>Readerton - PDF Archive</title>
+    <title>Readerton</title>
     <style type="text/css">
-        * {{
+        * {
             -webkit-box-sizing: border-box;
             box-sizing: border-box;
-        }}
+        }
         body {
-            font-family: Arial, sans-serif;
+            font-family: Arial, Helvetica, sans-serif;
             max-width: 1400px;
             margin: 20px auto;
             padding: 0 15px;
@@ -803,6 +805,28 @@ def generate_html_index():
             margin-top: 30px;
             border-bottom: 2px solid #95a5a6;
             padding-bottom: 5px;
+        }
+        .controls {
+            background: #2c3e50;
+            padding: 15px;
+            margin-bottom: 20px;
+            border-radius: 5px;
+            overflow: hidden;
+        }
+        .update-btn {
+            background: #27ae60;
+            color: #fff;
+            border: 2px solid #1e8449;
+            padding: 12px 24px;
+            font-size: 1.1em;
+            font-weight: bold;
+            cursor: pointer;
+            border-radius: 4px;
+        }
+        .controls-help {
+            margin-left: 15px;
+            font-size: 0.9em;
+            color: #bdc3c7;
         }
         .feed-section {
             background: white;
@@ -824,10 +848,15 @@ def generate_html_index():
             float: left;
             width: 48%;
             margin-right: 2%;
+            -webkit-box-sizing: border-box;
             box-sizing: border-box;
         }
-        .pdf-item:nth-child(2n) {
+        .article-item:nth-child(2n) {
             margin-right: 0;
+        }
+        .remove-cb {
+            float: left;
+            margin: 3px 8px 0 0;
         }
         .article-link {
             color: #2980b9;
@@ -860,103 +889,127 @@ def generate_html_index():
         }
     </style>
 </head>
-<body>
-    <h1>Readerton Article Archive</h1>
-"""
+<body>""")
 
-    # Add statistics
-    total_articles = sum(len(articles) for articles in article_data.values())
-    total_sources = len([f for f in article_data.values() if f])
+    # ----- Page title, form start, controls & stats (dynamic) -----
+    parts.append(f"""    <h1>Readerton</h1>
+    <form method="POST" action="/update" id="mainform"
+          onsubmit="var b=document.getElementById('updatebtn');b.value='Processing... please wait';b.disabled=true;">
+        <div class="controls">
+            <input type="submit" value="Update Feeds" id="updatebtn" class="update-btn">
+            <span class="controls-help">Check articles to remove, then click Update Feeds</span>
+        </div>
+        <div class="stats">
+            <strong>Total Articles:</strong> {total_articles} | <strong>Sources:</strong> {total_sources}
+        </div>""")
 
-    html_content += f"""    <div class="stats">
-        <strong>Total Articles:</strong> {total_articles} | <strong>Sources:</strong> {total_sources}
-    </div>
-"""
-
-    # Add each feed section
+    # ----- Feed sections with checkboxes -----
+    cb_counter = 0
     for feed_name, article_files in sorted(article_data.items()):
         if not article_files:
             continue
 
-        html_content += f"""    <div class="feed-section">
-        <h2>{feed_name}</h2>
-        <ul class="article-list">
-"""
+        parts.append(f"""        <div class="feed-section">
+            <h2>{feed_name}</h2>
+            <ul class="article-list">""")
 
-        # Split items into two columns (column-wise distribution)
+        # Two-column, column-wise distribution (same layout as before)
         mid_point = (len(article_files) + 1) // 2
         left_column = article_files[:mid_point]
         right_column = article_files[mid_point:]
 
-        # Interleave items from both columns
         for i in range(mid_point):
-            # Add left column item
+            # Left column item
             article = left_column[i]
-            html_content += f"""            <li class="article-item">
-                <a href="{article["relative_path"]}" class="article-link">{article["title"]}</a>
-                <div class="article-meta">
-                    <span class="date">{article["date"]}</span> |
-                    {article["word_count"]} words |
-                    {article["size_kb"]:.1f} KB
-                </div>
-            </li>
-"""
-            # Add right column item if it exists
+            cb_id = f"cb_{cb_counter}"
+            cb_counter += 1
+            parts.append(
+                f"""                <li class="article-item">
+                    <input type="checkbox" name="remove" value="{article["relative_path"]}" id="{cb_id}" class="remove-cb">
+                    <a href="{url_prefix}{article["relative_path"]}" class="article-link">{article["title"]}</a>
+                    <div class="article-meta">
+                        <span class="date">{article["date"]}</span> |
+                        {article["word_count"]} words |
+                        {article["size_kb"]:.1f} KB
+                    </div>
+                </li>"""
+            )
+
+            # Right column item (if it exists)
             if i < len(right_column):
                 article = right_column[i]
-                html_content += f"""            <li class="article-item">
-                <a href="{article["relative_path"]}" class="article-link">{article["title"]}</a>
-                <div class="article-meta">
-                    <span class="date">{article["date"]}</span> |
-                    {article["word_count"]} words |
-                    {article["size_kb"]:.1f} KB
-                </div>
-            </li>
-"""
+                cb_id = f"cb_{cb_counter}"
+                cb_counter += 1
+                parts.append(
+                    f"""                <li class="article-item">
+                    <input type="checkbox" name="remove" value="{article["relative_path"]}" id="{cb_id}" class="remove-cb">
+                    <a href="{url_prefix}{article["relative_path"]}" class="article-link">{article["title"]}</a>
+                    <div class="article-meta">
+                        <span class="date">{article["date"]}</span> |
+                        {article["word_count"]} words |
+                        {article["size_kb"]:.1f} KB
+                    </div>
+                </li>"""
+                )
 
-        html_content += """        </ul>
-    </div>
-"""
+        parts.append("""            </ul>
+        </div>""")
 
-    # Add footer
+    # ----- Footer & close tags -----
     current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    html_content += f"""    <div class="footer">
-        Generated on {current_time}
-    </div>
+    parts.append(f"""        <div class="footer">
+            Generated on {current_time}
+        </div>
+    </form>
 </body>
-</html>
-"""
+</html>""")
+
+    html_content = "\n".join(parts)
 
     # Write HTML file
-    index_path = os.path.join(base_html_folder_name, "index.html")
+    index_path = os.path.join(base_folder, "index.html")
     with open(index_path, "w", encoding="utf-8") as f:
         f.write(html_content)
 
     logger.info("Generated HTML index: %s", index_path)
 
 
-def process_feeds():
+def process_feeds(
+    feeds: dict,
+    base_folder: str = "articles",
+    index_url: str = "../index.html",
+) -> None:
     """
-    Main loop: parse feeds, check state, generate HTML pages for new entries, update state
-    S3 upload is optional and commented by default.
+    Main loop: parse feeds, check state, generate HTML pages for new entries,
+    update state.
+
+    Parameters
+    ----------
+    feeds:
+        Mapping of feed_name -> feed_url.
+    base_folder:
+        Root directory where article sub-folders and state.json live.
+    index_url:
+        URL used in each article's "Back to index" link.
     """
-    # State tracking (uncomment and configure S3 or a local file as preferred)
-    seen_ids_old = set()
-    seen_ids_new = set()
+    os.makedirs(base_folder, exist_ok=True)
+
+    # State tracking
+    state_path = os.path.join(base_folder, "state.json")
+    seen_ids_old: set = set()
+    seen_ids_new: set = set()
     try:
-        # state_obj = s3.get_object(Bucket=bucket_name, Key="state.json")
-        # seen_ids_old = set(json.loads(state_obj["Body"].read().decode()))
-        with open(f"{base_html_folder_name}/state.json", "r") as state_file:
+        with open(state_path, "r") as state_file:
             seen_ids_old = set(json.load(state_file))
     except Exception:
         pass
 
-    for feed_name, feed_url in FEEDS.items():
+    for feed_name, feed_url in feeds.items():
         logger.info("Processing feed: %s (%s)", feed_name, feed_url)
         feed = feedparser.parse(feed_url)
 
         # Create subfolder using feed name
-        domain_folder = os.path.abspath(f"./{base_html_folder_name}/{feed_name}")
+        domain_folder = os.path.join(os.path.abspath(base_folder), feed_name)
         os.makedirs(domain_folder, exist_ok=True)
 
         for entry in feed.entries:
@@ -974,7 +1027,7 @@ def process_feeds():
                 logger.warning("Skipping entry without link: %s", title)
                 continue
 
-            # If using state tracking, skip seen items
+            # Skip already-seen items
             if entry_id in seen_ids_old:
                 logger.debug("Already processed entry: %s", entry_id)
                 continue
@@ -1005,13 +1058,17 @@ def process_feeds():
 
             # Generate HTML page
             try:
-                ok, word_count = generate_html_from_url(link, temp_filename, title)
+                ok, word_count = generate_html_from_url(
+                    link, temp_filename, title, index_url=index_url
+                )
                 if not ok:
                     logger.error("Failed to generate HTML for %s", link)
                     continue
                 if ok and word_count == 0:
                     logger.info(
-                        f"Skipped article (less than {MIN_NB_WORDS} words): {link}"
+                        "Skipped article (less than %d words): %s",
+                        MIN_NB_WORDS,
+                        link,
                     )
                     continue
 
@@ -1034,33 +1091,31 @@ def process_feeds():
                 if os.path.exists(temp_filename):
                     try:
                         os.remove(temp_filename)
-                    except:
+                    except Exception:
                         pass
                 continue
 
-            # Optional: upload to S3 and update seen state
-            # if s3:
-            #     try:
-            #         s3.upload_file(final_filename, bucket_name, f"articles/{feed_name}/{os.path.basename(final_filename)}")
-            #         logger.info("Uploaded article to S3: %s", final_filename)
-            #     except Exception as exc:
-            #         logger.warning("Failed to upload %s to S3: %s", final_filename, exc)
-            #
-
-    # persist state back
+    # Persist state – merge old + new to avoid forgetting previously seen entries
     try:
-        # s3.put_object(Bucket=bucket_name, Key="state.json", Body=json.dumps(list(seen_ids)))
-        # Merge previously seen IDs with newly seen IDs to avoid forgetting old entries
         seen_ids_all = seen_ids_old | seen_ids_new
-        with open(f"{base_html_folder_name}/state.json", "w") as state_file:
+        with open(state_path, "w") as state_file:
             json.dump(list(seen_ids_all), state_file)
     except Exception:
         pass
 
 
-def main():
-    process_feeds()
-    generate_html_index()
+def main() -> None:
+    """Entry-point for standalone (local) usage."""
+    setup_logging("log.txt")
+    config = load_config("config.json")
+    feeds = config.get("feeds", {})
+    base_folder = config.get(
+        "base_html_folder_name", config.get("base_pdf_folder_name", "articles")
+    )
+    if not feeds:
+        logger.warning("No feeds configured in config.json")
+    process_feeds(feeds=feeds, base_folder=base_folder)
+    generate_html_index(base_folder=base_folder)
 
 
 if __name__ == "__main__":
