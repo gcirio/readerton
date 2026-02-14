@@ -694,13 +694,14 @@ def generate_html_from_url(
     return False, 0
 
 
-def generate_html_index(base_folder: str = "articles", url_prefix: str = "") -> None:
+def generate_html_index(
+    base_folder: str = "articles",
+    url_prefix: str = "",
+    interactive: bool = True,
+) -> None:
     """
     Generate a static HTML index page with links to all articles, organized by
     feed and sorted by date.  Compatible with older browsers (Android 4).
-
-    Includes a form with an Update Feeds button and per-article checkboxes for
-    removal.  The form POSTs to ``/update``.
 
     Parameters
     ----------
@@ -710,6 +711,10 @@ def generate_html_index(base_folder: str = "articles", url_prefix: str = "") -> 
         String prepended to article hrefs.  Use ``""`` when the index lives
         inside *base_folder* (local mode) and ``"articles/"`` when the index
         is served at ``/`` (Modal mode).
+    interactive:
+        When True (default) the page includes a form with an Update Feeds
+        button and per-article removal checkboxes that POST to ``/update``.
+        Set to False for a purely static site (e.g. uploaded to pCloud).
     """
     # Collect all articles organized by feed
     article_data: dict[str, list[dict]] = {}
@@ -892,7 +897,9 @@ def generate_html_index(base_folder: str = "articles", url_prefix: str = "") -> 
 <body>""")
 
     # ----- Page title, form start, controls & stats (dynamic) -----
-    parts.append(f"""    <h1>Readerton</h1>
+    current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    if interactive:
+        parts.append(f"""    <h1>Readerton</h1>
     <form method="POST" action="/update" id="mainform"
           onsubmit="var b=document.getElementById('updatebtn');b.value='Processing... please wait';b.disabled=true;">
         <div class="controls">
@@ -901,6 +908,17 @@ def generate_html_index(base_folder: str = "articles", url_prefix: str = "") -> 
         </div>
         <div class="stats">
             <strong>Total Articles:</strong> {total_articles} | <strong>Sources:</strong> {total_sources}
+        </div>
+        <div class="footer" style="margin-bottom:20px;margin-top:0;">
+            Generated on {current_time}
+        </div>""")
+    else:
+        parts.append(f"""    <h1>Readerton</h1>
+        <div class="stats">
+            <strong>Total Articles:</strong> {total_articles} | <strong>Sources:</strong> {total_sources}
+        </div>
+        <div class="footer" style="margin-bottom:20px;margin-top:0;">
+            Generated on {current_time}
         </div>""")
 
     # ----- Feed sections with checkboxes -----
@@ -923,23 +941,7 @@ def generate_html_index(base_folder: str = "articles", url_prefix: str = "") -> 
             article = left_column[i]
             cb_id = f"cb_{cb_counter}"
             cb_counter += 1
-            parts.append(
-                f"""                <li class="article-item">
-                    <input type="checkbox" name="remove" value="{article["relative_path"]}" id="{cb_id}" class="remove-cb">
-                    <a href="{url_prefix}{article["relative_path"]}" class="article-link">{article["title"]}</a>
-                    <div class="article-meta">
-                        <span class="date">{article["date"]}</span> |
-                        {article["word_count"]} words |
-                        {article["size_kb"]:.1f} KB
-                    </div>
-                </li>"""
-            )
-
-            # Right column item (if it exists)
-            if i < len(right_column):
-                article = right_column[i]
-                cb_id = f"cb_{cb_counter}"
-                cb_counter += 1
+            if interactive:
                 parts.append(
                     f"""                <li class="article-item">
                     <input type="checkbox" name="remove" value="{article["relative_path"]}" id="{cb_id}" class="remove-cb">
@@ -951,17 +953,57 @@ def generate_html_index(base_folder: str = "articles", url_prefix: str = "") -> 
                     </div>
                 </li>"""
                 )
+            else:
+                parts.append(
+                    f"""                <li class="article-item">
+                    <a href="{url_prefix}{article["relative_path"]}" class="article-link">{article["title"]}</a>
+                    <div class="article-meta">
+                        <span class="date">{article["date"]}</span> |
+                        {article["word_count"]} words |
+                        {article["size_kb"]:.1f} KB
+                    </div>
+                </li>"""
+                )
+
+            # Right column item (if it exists)
+            if i < len(right_column):
+                article = right_column[i]
+                cb_id = f"cb_{cb_counter}"
+                cb_counter += 1
+                if interactive:
+                    parts.append(
+                        f"""                <li class="article-item">
+                    <input type="checkbox" name="remove" value="{article["relative_path"]}" id="{cb_id}" class="remove-cb">
+                    <a href="{url_prefix}{article["relative_path"]}" class="article-link">{article["title"]}</a>
+                    <div class="article-meta">
+                        <span class="date">{article["date"]}</span> |
+                        {article["word_count"]} words |
+                        {article["size_kb"]:.1f} KB
+                    </div>
+                </li>"""
+                    )
+                else:
+                    parts.append(
+                        f"""                <li class="article-item">
+                    <a href="{url_prefix}{article["relative_path"]}" class="article-link">{article["title"]}</a>
+                    <div class="article-meta">
+                        <span class="date">{article["date"]}</span> |
+                        {article["word_count"]} words |
+                        {article["size_kb"]:.1f} KB
+                    </div>
+                </li>"""
+                    )
 
         parts.append("""            </ul>
         </div>""")
 
     # ----- Footer & close tags -----
-    current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    parts.append(f"""        <div class="footer">
-            Generated on {current_time}
-        </div>
-    </form>
+    if interactive:
+        parts.append("""    </form>
 </body>
+</html>""")
+    else:
+        parts.append("""</body>
 </html>""")
 
     html_content = "\n".join(parts)

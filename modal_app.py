@@ -1,21 +1,25 @@
 """
 readerton/modal_app.py
 
-Modal web application for Readerton.
+Modal scheduled job for Readerton.
 
-Serves the article index and individual article pages from a persistent
-Modal Volume.  Provides a POST /update endpoint that removes checked
-articles and fetches new feed entries.
+Processes RSS feeds, generates static HTML pages and an index, then uploads
+everything to pCloud (into /Public Folder/readerton) using digest
+authentication.
+
+The job runs daily at 9 PM Paris time.
 
 Deploy
 ------
     modal deploy modal_app.py
 
-Local dev server
-----------------
-    modal serve modal_app.py
+Manual trigger
+--------------
+    modal run modal_app.py::update
 """
 
+import hashlib
+import logging
 import os
 
 import modal
@@ -34,7 +38,6 @@ image = (
         "beautifulsoup4",
         "feedparser",
         "requests",
-        "fastapi[standard]",
         "lxml",
     )
     .add_local_file("main.py", "/root/main.py")
@@ -44,8 +47,276 @@ image = (
 VOLUME_PATH = "/data"
 CONFIG_PATH = "/root/config.json"
 
+# Try EU first, then US.  Override with PCLOUD_API_HOST to skip auto-detection.
+PCLOUD_ENDPOINTS = [
+    "https://eapi.pcloud.com",  # Europe
+    "https://api.pcloud.com",  # United States
+]
+
+logger = logging.getLogger("readerton.pcloud")
+
+# Resolved at auth time; used by all subsequent helpers.
+_active_api_base: str | None = None
+
 # ---------------------------------------------------------------------------
-# Web application
+# pCloud helpers
+# ---------------------------------------------------------------------------
+
+
+def _pcloud_api_base() -> str:
+    override = os.environ.get("PCLOUD_API_HOST", "").strip().rstrip("/")
+    if override:
+        return override
+    if _active_api_base:
+        return _active_api_base
+    return PCLOUD_ENDPOINTS[0]
+
+
+def _try_digest_auth(api: str, username: str, password: str) -> str | None:
+    """
+    Attempt digest auth against a single pCloud endpoint.
+
+    Tries SHA256 first, then SHA1.  Returns an auth token on success,
+    or ``None`` if login failed (result 2000).  Raises on unexpected errors.
+    """
+    import requests
+
+    # Step 1 – obtain a one-time digest
+    resp = requests.get(f"{api}/getdigest", timeout=30)
+    resp.raise_for_status()
+    data = resp.json()
+    if data.get("result", 0) != 0:
+        raise RuntimeError(f"getdigest failed on {api}: {data}")
+    digest = data["digest"]
+
+    # Step 2 – try SHA256 then SHA1 for the password digest
+    username_lower_bytes = username.lower().encode("utf-8")
+    password_bytes = password.encode("utf-8")
+    digest_bytes = digest.encode("utf-8")
+
+    candidates = []
+    for hash_fn in (hashlib.sha256, hashlib.sha1):
+        inner = hash_fn(username_lower_bytes).hexdigest().encode("utf-8")
+        pd = hash_fn(password_bytes + inner + digest_bytes).hexdigest()
+        candidates.append((hash_fn().name, pd))
+
+    for hash_name, password_digest in candidates:
+        # Need a fresh digest for each attempt (they are single-use / short-lived)
+        # but within the 30-second window we can reuse the same one.
+        resp = requests.get(
+            f"{api}/userinfo",
+            params={
+                "getauth": 1,
+                "logout": 1,
+                "username": username,
+                "digest": digest,
+                "passworddigest": password_digest,
+                "authexpire": 3600,
+            },
+            timeout=30,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+        if data.get("result", 0) == 0 and data.get("auth"):
+            logger.info(
+                "pCloud digest auth successful on %s using %s for %s",
+                api,
+                hash_name,
+                username,
+            )
+            return data["auth"]
+
+        # result 2000 = "Log in failed" → wrong hash or wrong server, try next
+        if data.get("result") == 2000:
+            logger.debug(
+                "Auth attempt failed on %s with %s (result 2000)", api, hash_name
+            )
+            # Fetch a fresh digest for the next attempt (previous may be consumed)
+            resp = requests.get(f"{api}/getdigest", timeout=30)
+            resp.raise_for_status()
+            ddata = resp.json()
+            if ddata.get("result", 0) != 0:
+                raise RuntimeError(f"getdigest failed on {api}: {ddata}")
+            digest = ddata["digest"]
+            digest_bytes = digest.encode("utf-8")
+            # Recompute remaining candidates with fresh digest
+            # (only matters if there's a next candidate)
+            remaining_idx = candidates.index((hash_name, password_digest)) + 1
+            for i in range(remaining_idx, len(candidates)):
+                h_name = candidates[i][0]
+                hfn = hashlib.sha256 if h_name == "sha256" else hashlib.sha1
+                inner = hfn(username_lower_bytes).hexdigest().encode("utf-8")
+                candidates[i] = (
+                    h_name,
+                    hfn(password_bytes + inner + digest_bytes).hexdigest(),
+                )
+            continue
+
+        # Any other error is unexpected
+        raise RuntimeError(f"pCloud auth unexpected response on {api}: {data}")
+
+    return None  # all attempts on this endpoint failed
+
+
+def pcloud_digest_auth(username: str, password: str) -> str:
+    """
+    Authenticate with pCloud using digest authentication.
+
+    Tries both EU and US endpoints, and both SHA256 and SHA1 hashing,
+    to find the right combination automatically.
+
+    Returns an auth token valid for subsequent API calls.
+    Sets ``_active_api_base`` so all later helpers hit the correct server.
+    """
+    global _active_api_base
+
+    override = os.environ.get("PCLOUD_API_HOST", "").strip().rstrip("/")
+    endpoints = [override] if override else list(PCLOUD_ENDPOINTS)
+
+    errors: list[str] = []
+    for api in endpoints:
+        logger.info("Trying pCloud endpoint %s ...", api)
+        try:
+            token = _try_digest_auth(api, username, password)
+            if token:
+                _active_api_base = api
+                return token
+            errors.append(f"{api}: login failed (wrong credentials or server)")
+        except Exception as exc:
+            errors.append(f"{api}: {exc}")
+            logger.warning("pCloud auth error on %s: %s", api, exc)
+
+    raise RuntimeError(
+        "pCloud authentication failed on all endpoints. "
+        "Please verify PCLOUD_USERNAME and PCLOUD_PASSWORD are correct.\n"
+        + "\n".join(f"  - {e}" for e in errors)
+    )
+
+
+def _collect_remote_files(metadata: dict, prefix: str, result: set) -> None:
+    """Recursively collect relative file paths from a listfolder metadata tree."""
+    for item in metadata.get("contents", []):
+        name = item["name"]
+        rel = f"{prefix}/{name}" if prefix else name
+        if item.get("isfolder", False):
+            _collect_remote_files(item, rel, result)
+        else:
+            result.add(rel)
+
+
+def pcloud_upload_folder(
+    auth: str,
+    local_folder: str,
+    remote_base_path: str,
+) -> None:
+    """
+    Upload *local_folder* to *remote_base_path* on pCloud.
+
+    - Files that already exist remotely are **skipped**.
+    - ``index.html`` and ``state.json`` are **always overwritten**.
+    """
+    import requests
+
+    api = _pcloud_api_base()
+
+    # ---- Ensure destination folder exists --------------------------------
+    resp = requests.get(
+        f"{api}/createfolderifnotexists",
+        params={"auth": auth, "path": remote_base_path},
+        timeout=30,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    if data.get("result", 0) not in (0,):
+        raise RuntimeError(
+            f"createfolderifnotexists failed for {remote_base_path}: {data}"
+        )
+    logger.info("Remote folder ready: %s", remote_base_path)
+
+    # ---- List existing remote files (recursive) --------------------------
+    existing_files: set[str] = set()
+    resp = requests.get(
+        f"{api}/listfolder",
+        params={"auth": auth, "path": remote_base_path, "recursive": 1},
+        timeout=60,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    if data.get("result", 0) == 0:
+        _collect_remote_files(data["metadata"], "", existing_files)
+        logger.info(
+            "Found %d existing files in %s", len(existing_files), remote_base_path
+        )
+    else:
+        logger.warning(
+            "listfolder returned result=%s – assuming empty", data.get("result")
+        )
+
+    # Files that must always be re-uploaded
+    ALWAYS_OVERWRITE = {"index.html", "state.json"}
+
+    uploaded = 0
+    skipped = 0
+
+    for root, dirs, files in os.walk(local_folder):
+        rel_root = os.path.relpath(root, local_folder)
+        if rel_root == ".":
+            rel_root = ""
+
+        # Create sub-folders on the remote side
+        for d in dirs:
+            sub = (
+                f"{remote_base_path}/{rel_root}/{d}"
+                if rel_root
+                else f"{remote_base_path}/{d}"
+            )
+            resp = requests.get(
+                f"{api}/createfolderifnotexists",
+                params={"auth": auth, "path": sub},
+                timeout=30,
+            )
+            resp.raise_for_status()
+            rdata = resp.json()
+            if rdata.get("result", 0) != 0:
+                logger.warning("Could not create remote folder %s: %s", sub, rdata)
+
+        # Upload files
+        for fname in files:
+            local_path = os.path.join(root, fname)
+            rel_file = f"{rel_root}/{fname}" if rel_root else fname
+
+            should_overwrite = fname in ALWAYS_OVERWRITE
+            if not should_overwrite and rel_file in existing_files:
+                skipped += 1
+                continue
+
+            remote_dir = (
+                f"{remote_base_path}/{rel_root}" if rel_root else remote_base_path
+            )
+
+            with open(local_path, "rb") as fh:
+                resp = requests.post(
+                    f"{api}/uploadfile",
+                    data={"auth": auth, "path": remote_dir},
+                    files={"file": (fname, fh)},
+                    timeout=120,
+                )
+            resp.raise_for_status()
+            rdata = resp.json()
+            if rdata.get("result", 0) != 0:
+                logger.error("uploadfile failed for %s: %s", rel_file, rdata)
+            else:
+                uploaded += 1
+                logger.info("Uploaded: %s", rel_file)
+
+    logger.info(
+        "pCloud sync complete – uploaded %d, skipped %d existing", uploaded, skipped
+    )
+
+
+# ---------------------------------------------------------------------------
+# Scheduled Modal function
 # ---------------------------------------------------------------------------
 
 
@@ -53,121 +324,55 @@ CONFIG_PATH = "/root/config.json"
     image=image,
     volumes={VOLUME_PATH: volume},
     timeout=900,
-    # Keep one container warm so the index loads instantly
-    # min_containers=1,
+    secrets=[modal.Secret.from_name("pcloud-credentials")],
+    schedule=modal.Cron("0 19 * * *"),  # 19:00 UTC ≈ 21:00 Europe/Paris (CET)
 )
-@modal.asgi_app()
-def web():
+def update():
+    """Process feeds, generate static HTML index, upload to pCloud."""
     import sys
 
     sys.path.insert(0, "/root")
 
-    from fastapi import FastAPI, Request
-    from fastapi.responses import HTMLResponse, RedirectResponse
-
     import main as readerton
 
-    readerton.setup_logging(log_file=None)  # console only inside Modal
+    readerton.setup_logging(log_file=None)  # console-only inside Modal
+    logger.setLevel(logging.INFO)
 
-    fastapi_app = FastAPI(title="Readerton")
+    config = readerton.load_config(CONFIG_PATH)
+    feeds = config.get("feeds", {})
+    folder_name = config.get(
+        "base_html_folder_name",
+        config.get("base_pdf_folder_name", "articles"),
+    )
+    base_folder = os.path.join(VOLUME_PATH, folder_name)
+    os.makedirs(base_folder, exist_ok=True)
 
-    def _base_folder() -> str:
-        config = readerton.load_config(CONFIG_PATH)
-        folder_name = config.get(
-            "base_html_folder_name",
-            config.get("base_pdf_folder_name", "articles"),
-        )
-        return os.path.join(VOLUME_PATH, folder_name)
+    # 1. Fetch new feed entries and generate article pages ----------------
+    readerton.process_feeds(
+        feeds=feeds,
+        base_folder=base_folder,
+        index_url="../index.html",
+    )
 
-    # ------------------------------------------------------------------
-    # GET /  –  serve the index page
-    # ------------------------------------------------------------------
-    @fastapi_app.get("/", response_class=HTMLResponse)
-    async def index():
-        volume.reload()
-        index_path = os.path.join(_base_folder(), "index.html")
-        if os.path.exists(index_path):
-            with open(index_path, "r", encoding="utf-8") as fh:
-                return HTMLResponse(fh.read())
+    # 2. (Re)generate the index page -------------------------------------
+    readerton.generate_html_index(
+        base_folder=base_folder,
+        url_prefix="",
+        interactive=False,
+    )
 
-        # No index yet – show a minimal page with the Update button
-        return HTMLResponse(
-            "<!DOCTYPE html>"
-            "<html><head>"
-            '<meta charset="UTF-8">'
-            '<meta name="viewport" content="width=device-width, initial-scale=1.0">'
-            "<title>Readerton</title>"
-            "<style>body{font-family:Arial,sans-serif;max-width:800px;"
-            "margin:40px auto;padding:0 15px;}"
-            ".update-btn{background:#27ae60;color:#fff;border:2px solid #1e8449;"
-            "padding:12px 24px;font-size:1.1em;font-weight:bold;cursor:pointer;"
-            "border-radius:4px;}</style>"
-            "</head><body>"
-            "<h1>Readerton</h1>"
-            "<p>No articles yet.  Click the button below to fetch feeds.</p>"
-            '<form method="POST" action="/update">'
-            '<input type="submit" value="Update Feeds" class="update-btn">'
-            "</form>"
-            "</body></html>"
-        )
+    # 3. Persist volume so state survives across invocations --------------
+    volume.commit()
 
-    # ------------------------------------------------------------------
-    # GET /articles/{feed}/{filename}  –  serve an individual article
-    # ------------------------------------------------------------------
-    @fastapi_app.get("/articles/{feed}/{filename}", response_class=HTMLResponse)
-    async def article(feed: str, filename: str):
-        volume.reload()
-        # Prevent directory traversal
-        if ".." in feed or ".." in filename:
-            return HTMLResponse("Forbidden", status_code=403)
+    # 4. Upload to pCloud -------------------------------------------------
+    username = os.environ["PCLOUD_USERNAME"]
+    password = os.environ["PCLOUD_PASSWORD"]
 
-        filepath = os.path.join(_base_folder(), feed, filename)
-        if os.path.exists(filepath):
-            with open(filepath, "r", encoding="utf-8") as fh:
-                return HTMLResponse(fh.read())
+    auth_token = pcloud_digest_auth(username, password)
+    pcloud_upload_folder(
+        auth=auth_token,
+        local_folder=base_folder,
+        remote_base_path="/Public Folder/readerton",
+    )
 
-        return HTMLResponse("Not found", status_code=404)
-
-    # ------------------------------------------------------------------
-    # POST /update  –  remove checked articles, process feeds, rebuild index
-    # ------------------------------------------------------------------
-    @fastapi_app.post("/update")
-    async def update(request: Request):
-        form = await request.form()
-        removals = form.getlist("remove")
-
-        config = readerton.load_config(CONFIG_PATH)
-        feeds = config.get("feeds", {})
-        base_folder = _base_folder()
-        os.makedirs(base_folder, exist_ok=True)
-
-        # 1. Remove articles the user checked for deletion
-        for rel_path in removals:
-            safe = os.path.normpath(rel_path)
-            if ".." in safe:
-                continue
-            abs_path = os.path.join(base_folder, safe)
-            if os.path.isfile(abs_path):
-                os.remove(abs_path)
-                readerton.logger.info("Removed article: %s", abs_path)
-
-        # 2. Fetch new feed entries
-        readerton.process_feeds(
-            feeds=feeds,
-            base_folder=base_folder,
-            index_url="/",
-        )
-
-        # 3. Regenerate the index page
-        readerton.generate_html_index(
-            base_folder=base_folder,
-            url_prefix="articles/",
-        )
-
-        # 4. Persist volume changes
-        volume.commit()
-
-        # Redirect back to the index (303 See Other → browser does GET)
-        return RedirectResponse("/", status_code=303)
-
-    return fastapi_app
+    logger.info("Readerton update complete.")
