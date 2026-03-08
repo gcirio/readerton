@@ -17,6 +17,7 @@ import logging
 import os
 import re
 from datetime import datetime
+from html import escape
 from typing import Optional, Tuple
 from urllib.parse import urljoin, urlparse
 
@@ -121,18 +122,21 @@ def preprocess_html_for_images(html: str) -> str:
         for img in soup.find_all("img"):
             # If img has a lazy loading attribute but no src or a placeholder src
             for attr in lazy_attrs:
-                if img.get(attr):
-                    actual_src = img.get(attr)
-                    current_src = img.get("src", "")
-                    # Replace if no src or if src looks like a placeholder
-                    if (
-                        not current_src
-                        or "placeholder" in current_src.lower()
-                        or "data:image" in current_src
-                    ):
-                        img["src"] = actual_src
-                        logger.debug("Converted %s to src: %s", attr, actual_src)
-                        break
+                actual_src = img.get(attr)
+                if not isinstance(actual_src, str) or not actual_src:
+                    continue
+
+                current_src = img.get("src", "")
+                current_src_str = current_src if isinstance(current_src, str) else ""
+                # Replace if no src or if src looks like a placeholder
+                if (
+                    not current_src_str
+                    or "placeholder" in current_src_str.lower()
+                    or "data:image" in current_src_str
+                ):
+                    img["src"] = actual_src
+                    logger.debug("Converted %s to src: %s", attr, actual_src)
+                    break
 
         # Extract images from noscript tags (common in Substack and similar platforms)
         for noscript in soup.find_all("noscript"):
@@ -176,7 +180,8 @@ def extract_main_html(
         if not title:
             og_title = soup.find("meta", property="og:title")
             if og_title:
-                title = og_title.get("content", "").strip()
+                og_content = og_title.get("content", "")
+                title = og_content.strip() if isinstance(og_content, str) else None
 
         logger.debug("Extracted title: %s", title)
 
@@ -694,6 +699,51 @@ def generate_html_from_url(
     return False, 0
 
 
+def load_removed_articles(base_folder: str = "articles") -> set[str]:
+    """Load the set of article paths flagged for removal."""
+    removed_path = os.path.join(os.path.abspath(base_folder), "removed_articles.json")
+    try:
+        with open(removed_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, list):
+            return {str(item) for item in data if isinstance(item, str)}
+    except FileNotFoundError:
+        return set()
+    except Exception as exc:
+        logger.warning("Failed to load removed articles from %s: %s", removed_path, exc)
+    return set()
+
+
+def save_removed_articles(
+    removed_articles: set[str], base_folder: str = "articles"
+) -> None:
+    """Persist the set of article paths flagged for removal."""
+    removed_path = os.path.join(os.path.abspath(base_folder), "removed_articles.json")
+    try:
+        with open(removed_path, "w", encoding="utf-8") as f:
+            json.dump(sorted(removed_articles), f, indent=2)
+    except Exception as exc:
+        logger.warning("Failed to save removed articles to %s: %s", removed_path, exc)
+
+
+def add_removed_articles(
+    article_paths: list[str], base_folder: str = "articles"
+) -> set[str]:
+    """Add article paths to the persistent removal set and return the full set."""
+    normalized_paths = {
+        path.strip().lstrip("/").replace("\\", "/")
+        for path in article_paths
+        if isinstance(path, str) and path.strip()
+    }
+    if not normalized_paths:
+        return load_removed_articles(base_folder)
+
+    removed_articles = load_removed_articles(base_folder)
+    removed_articles.update(normalized_paths)
+    save_removed_articles(removed_articles, base_folder)
+    return removed_articles
+
+
 def generate_html_index(
     base_folder: str = "articles",
     url_prefix: str = "",
@@ -712,9 +762,9 @@ def generate_html_index(
         inside *base_folder* (local mode) and ``"articles/"`` when the index
         is served at ``/`` (Modal mode).
     interactive:
-        When True (default) the page includes a form with an Update Feeds
-        button and per-article removal checkboxes that POST to ``/update``.
-        Set to False for a purely static site (e.g. uploaded to pCloud).
+        When True (default) the page includes controls for updating feeds and
+        flagging articles for removal. Set to False for a purely static site
+        (e.g. uploaded to pCloud), where removed articles are excluded.
     """
     # Collect all articles organized by feed
     article_data: dict[str, list[dict]] = {}
@@ -723,6 +773,8 @@ def generate_html_index(
     if not os.path.exists(base_folder_abs):
         logger.warning("Base folder does not exist: %s", base_folder_abs)
         return
+
+    removed_articles = load_removed_articles(base_folder_abs)
 
     # Get all subdirectories (feed folders)
     feed_names = [
@@ -737,6 +789,10 @@ def generate_html_index(
 
         for filename in os.listdir(domain_folder):
             if filename.endswith(".html") and filename != "index.html":
+                relative_path = f"{feed_name}/{filename}"
+                if relative_path in removed_articles:
+                    continue
+
                 filepath = os.path.join(domain_folder, filename)
 
                 # Extract date from filename (format: YYYY-MM-DD_...)
@@ -763,7 +819,7 @@ def generate_html_index(
                         "date": date_str,
                         "word_count": word_count,
                         "size_kb": size_kb,
-                        "relative_path": f"{feed_name}/{filename}",
+                        "relative_path": relative_path,
                     }
                 )
 
@@ -796,7 +852,7 @@ def generate_html_index(
             font-family: Arial, Helvetica, sans-serif;
             max-width: 1400px;
             margin: 20px auto;
-            padding: 0 15px;
+            padding: 0 15px 40px 15px;
             background-color: #f5f5f5;
             color: #333;
         }
@@ -818,18 +874,29 @@ def generate_html_index(
             border-radius: 5px;
             overflow: hidden;
         }
-        .update-btn {
-            background: #27ae60;
+        .control-buttons {
+            margin-bottom: 10px;
+        }
+        .update-btn,
+        .remove-btn {
             color: #fff;
-            border: 2px solid #1e8449;
+            border: 2px solid;
             padding: 12px 24px;
-            font-size: 1.1em;
+            font-size: 1.05em;
             font-weight: bold;
             cursor: pointer;
             border-radius: 4px;
+            margin-right: 10px;
+        }
+        .update-btn {
+            background: #27ae60;
+            border-color: #1e8449;
+        }
+        .remove-btn {
+            background: #c0392b;
+            border-color: #922b21;
         }
         .controls-help {
-            margin-left: 15px;
             font-size: 0.9em;
             color: #bdc3c7;
         }
@@ -885,6 +952,21 @@ def generate_html_index(
             border-radius: 5px;
             margin-bottom: 20px;
         }
+        .message {
+            background: #fef3c7;
+            border: 1px solid #f59e0b;
+            color: #92400e;
+            padding: 12px 15px;
+            border-radius: 5px;
+            margin-bottom: 20px;
+        }
+        .empty-state {
+            background: white;
+            padding: 20px;
+            border-radius: 5px;
+            color: #7f8c8d;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
         .footer {
             text-align: center;
             margin-top: 40px;
@@ -898,13 +980,19 @@ def generate_html_index(
 
     # ----- Page title, form start, controls & stats (dynamic) -----
     current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    status_message = None
+    if interactive:
+        status_message = os.environ.get("READERTON_STATUS_MESSAGE", "").strip() or None
+
     if interactive:
         parts.append(f"""    <h1>Readerton</h1>
-    <form method="POST" action="/update" id="mainform"
-          onsubmit="var b=document.getElementById('updatebtn');b.value='Processing... please wait';b.disabled=true;">
+    <form method="POST" action="/remove" id="mainform"
+          onsubmit="var r=document.getElementById('removebtn'); if (r) {{ r.disabled=true; r.innerHTML='Removing...'; }}">
         <div class="controls">
-            <input type="submit" value="Update Feeds" id="updatebtn" class="update-btn">
-            <span class="controls-help">Check articles to remove, then click Update Feeds</span>
+            <div class="control-buttons">
+                <button type="submit" id="removebtn" class="remove-btn">Remove selected</button>
+            </div>
+            <div class="controls-help">Select any articles you want hidden from future static site generations, then click Remove selected.</div>
         </div>
         <div class="stats">
             <strong>Total Articles:</strong> {total_articles} | <strong>Sources:</strong> {total_sources}
@@ -912,6 +1000,10 @@ def generate_html_index(
         <div class="footer" style="margin-bottom:20px;margin-top:0;">
             Generated on {current_time}
         </div>""")
+        if status_message:
+            parts.append(
+                f"""        <div class="message">{escape(status_message)}</div>"""
+            )
     else:
         parts.append(f"""    <h1>Readerton</h1>
         <div class="stats">
@@ -923,12 +1015,14 @@ def generate_html_index(
 
     # ----- Feed sections with checkboxes -----
     cb_counter = 0
+    rendered_feeds = 0
     for feed_name, article_files in sorted(article_data.items()):
         if not article_files:
             continue
 
+        rendered_feeds += 1
         parts.append(f"""        <div class="feed-section">
-            <h2>{feed_name}</h2>
+            <h2>{escape(feed_name)}</h2>
             <ul class="article-list">""")
 
         # Two-column, column-wise distribution (same layout as before)
@@ -941,11 +1035,15 @@ def generate_html_index(
             article = left_column[i]
             cb_id = f"cb_{cb_counter}"
             cb_counter += 1
+            article_href = f"{url_prefix}{article['relative_path']}"
+            article_title = escape(article["title"])
             if interactive:
                 parts.append(
                     f"""                <li class="article-item">
-                    <input type="checkbox" name="remove" value="{article["relative_path"]}" id="{cb_id}" class="remove-cb">
-                    <a href="{url_prefix}{article["relative_path"]}" class="article-link">{article["title"]}</a>
+                    <input type="checkbox" name="remove" value="{escape(article["relative_path"], quote=True)}" id="{cb_id}" class="remove-cb">
+                    <label for="{cb_id}">
+                        <a href="{escape(article_href, quote=True)}" class="article-link">{article_title}</a>
+                    </label>
                     <div class="article-meta">
                         <span class="date">{article["date"]}</span> |
                         {article["word_count"]} words |
@@ -956,7 +1054,7 @@ def generate_html_index(
             else:
                 parts.append(
                     f"""                <li class="article-item">
-                    <a href="{url_prefix}{article["relative_path"]}" class="article-link">{article["title"]}</a>
+                    <a href="{escape(article_href, quote=True)}" class="article-link">{article_title}</a>
                     <div class="article-meta">
                         <span class="date">{article["date"]}</span> |
                         {article["word_count"]} words |
@@ -970,11 +1068,15 @@ def generate_html_index(
                 article = right_column[i]
                 cb_id = f"cb_{cb_counter}"
                 cb_counter += 1
+                article_href = f"{url_prefix}{article['relative_path']}"
+                article_title = escape(article["title"])
                 if interactive:
                     parts.append(
                         f"""                <li class="article-item">
-                    <input type="checkbox" name="remove" value="{article["relative_path"]}" id="{cb_id}" class="remove-cb">
-                    <a href="{url_prefix}{article["relative_path"]}" class="article-link">{article["title"]}</a>
+                    <input type="checkbox" name="remove" value="{escape(article["relative_path"], quote=True)}" id="{cb_id}" class="remove-cb">
+                    <label for="{cb_id}">
+                        <a href="{escape(article_href, quote=True)}" class="article-link">{article_title}</a>
+                    </label>
                     <div class="article-meta">
                         <span class="date">{article["date"]}</span> |
                         {article["word_count"]} words |
@@ -985,7 +1087,7 @@ def generate_html_index(
                 else:
                     parts.append(
                         f"""                <li class="article-item">
-                    <a href="{url_prefix}{article["relative_path"]}" class="article-link">{article["title"]}</a>
+                    <a href="{escape(article_href, quote=True)}" class="article-link">{article_title}</a>
                     <div class="article-meta">
                         <span class="date">{article["date"]}</span> |
                         {article["word_count"]} words |
@@ -996,6 +1098,11 @@ def generate_html_index(
 
         parts.append("""            </ul>
         </div>""")
+
+    if rendered_feeds == 0:
+        parts.append(
+            """        <div class="empty-state">No available articles found.</div>"""
+        )
 
     # ----- Footer & close tags -----
     if interactive:
@@ -1077,10 +1184,24 @@ def process_feeds(
             # Get the published date if available
             date_str = ""
             if hasattr(entry, "published_parsed") and entry.published_parsed:
-                date_obj = datetime(*entry.published_parsed[:6])
+                published_parsed = entry.published_parsed
+                year = int(published_parsed[0])
+                month = int(published_parsed[1])
+                day = int(published_parsed[2])
+                hour = int(published_parsed[3])
+                minute = int(published_parsed[4])
+                second = int(published_parsed[5])
+                date_obj = datetime(year, month, day, hour, minute, second)
                 date_str = date_obj.strftime("%Y-%m-%d")
             elif hasattr(entry, "updated_parsed") and entry.updated_parsed:
-                date_obj = datetime(*entry.updated_parsed[:6])
+                updated_parsed = entry.updated_parsed
+                year = int(updated_parsed[0])
+                month = int(updated_parsed[1])
+                day = int(updated_parsed[2])
+                hour = int(updated_parsed[3])
+                minute = int(updated_parsed[4])
+                second = int(updated_parsed[5])
+                date_obj = datetime(year, month, day, hour, minute, second)
                 date_str = date_obj.strftime("%Y-%m-%d")
             else:
                 date_str = datetime.now().strftime("%Y-%m-%d")
