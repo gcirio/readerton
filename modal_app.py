@@ -17,6 +17,7 @@ Manual trigger
     modal run modal_app.py::update
 """
 
+import hashlib
 import logging
 import os
 from urllib.parse import quote_plus
@@ -59,34 +60,68 @@ WEB_STATUS_QUERY_PARAM = "message"
 # ---------------------------------------------------------------------------
 
 
-def pcloud_auth(username: str, password: str) -> str:
+def pcloud_open_session(username: str, password: str):
     """
-    Authenticate with pCloud using username and password.
+    Open a keep-alive requests.Session and authenticate with pCloud using
+    digest authentication (SHA256 then SHA1).
 
-    Returns an auth token valid for subsequent API calls.
+    All subsequent calls on the returned session reuse the same connection
+    and require no further credentials.
     """
     import requests
 
-    resp = requests.get(
-        f"{PCLOUD_ENDPOINT}/userinfo",
-        params={
-            "getauth": 1,
-            "logout": 1,
-            "username": username,
-            "password": password,
-            "authexpire": 3600,
-        },
-        timeout=30,
-    )
+    session = requests.Session()
+
+    username_lower_bytes = username.lower().encode("utf-8")
+    password_bytes = password.encode("utf-8")
+
+    # Fetch initial digest
+    resp = session.get(f"{PCLOUD_ENDPOINT}/getdigest", timeout=30)
     resp.raise_for_status()
     data = resp.json()
+    if data.get("result", 0) != 0:
+        raise RuntimeError(f"getdigest failed: {data}")
+    digest = data["digest"]
 
-    if data.get("result", 0) == 0 and data.get("auth"):
-        logger.info("pCloud auth successful for %s", username)
-        return data["auth"]
+    for hash_fn in (hashlib.sha256, hashlib.sha1):
+        digest_bytes = digest.encode("utf-8")
+        inner = hash_fn(username_lower_bytes).hexdigest().encode("utf-8")
+        password_digest = hash_fn(password_bytes + inner + digest_bytes).hexdigest()
+
+        resp = session.get(
+            f"{PCLOUD_ENDPOINT}/userinfo",
+            params={
+                "getauth": 1,
+                "logout": 1,
+                "username": username,
+                "digest": digest,
+                "passworddigest": password_digest,
+            },
+            timeout=30,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+        if data.get("result", 0) == 0:
+            logger.info(
+                "pCloud digest auth successful (%s) for %s", hash_fn().name, username
+            )
+            return session
+
+        if data.get("result") == 2000:
+            # Fetch a fresh digest for the next attempt
+            resp = session.get(f"{PCLOUD_ENDPOINT}/getdigest", timeout=30)
+            resp.raise_for_status()
+            ddata = resp.json()
+            if ddata.get("result", 0) != 0:
+                raise RuntimeError(f"getdigest failed: {ddata}")
+            digest = ddata["digest"]
+            continue
+
+        raise RuntimeError(f"pCloud auth unexpected response: {data}")
 
     raise RuntimeError(
-        f"pCloud authentication failed (result={data.get('result')}). "
+        "pCloud digest authentication failed. "
         "Please verify PCLOUD_USERNAME and PCLOUD_PASSWORD are correct."
     )
 
@@ -95,25 +130,23 @@ _ALWAYS_UPLOAD = {"index.html", "state.json", "removed_articles.json"}
 
 
 def pcloud_sync(
-    auth: str,
+    session,
     local_folder: str,
     remote_base_path: str,
     new_rel_paths: list[str],
     removed_rel_paths: set[str],
 ) -> None:
     """
-    Sync local changes to pCloud.
+    Sync local changes to pCloud over an already-authenticated session.
 
     - Uploads *new_rel_paths* (paths relative to *local_folder*).
     - Always re-uploads ``index.html``, ``state.json``, and ``removed_articles.json``.
     - Deletes each path in *removed_rel_paths* from the remote.
     """
-    import requests
-
     # Ensure base folder exists
-    resp = requests.get(
+    resp = session.get(
         f"{PCLOUD_ENDPOINT}/createfolderifnotexists",
-        params={"auth": auth, "path": remote_base_path},
+        params={"path": remote_base_path},
         timeout=30,
     )
     resp.raise_for_status()
@@ -131,16 +164,16 @@ def pcloud_sync(
         subdir = os.path.dirname(rel_path)
         remote_dir = f"{remote_base_path}/{subdir}" if subdir else remote_base_path
         if subdir:
-            r = requests.get(
+            r = session.get(
                 f"{PCLOUD_ENDPOINT}/createfolderifnotexists",
-                params={"auth": auth, "path": remote_dir},
+                params={"path": remote_dir},
                 timeout=30,
             )
             r.raise_for_status()
         with open(local_path, "rb") as fh:
-            r = requests.post(
+            r = session.post(
                 f"{PCLOUD_ENDPOINT}/uploadfile",
-                data={"auth": auth, "path": remote_dir},
+                data={"path": remote_dir},
                 files={"file": (os.path.basename(rel_path), fh)},
                 timeout=120,
             )
@@ -163,9 +196,9 @@ def pcloud_sync(
     deleted = 0
     for rel_path in removed_rel_paths:
         remote_path = f"{remote_base_path}/{rel_path}"
-        r = requests.get(
+        r = session.get(
             f"{PCLOUD_ENDPOINT}/deletefile",
-            params={"auth": auth, "path": remote_path},
+            params={"path": remote_path},
             timeout=30,
         )
         r.raise_for_status()
@@ -282,9 +315,9 @@ def update():
 
     removed_articles = readerton.load_removed_articles(base_folder=base_folder)
 
-    auth_token = pcloud_auth(username, password)
+    session = pcloud_open_session(username, password)
     pcloud_sync(
-        auth=auth_token,
+        session=session,
         local_folder=base_folder,
         remote_base_path="/Public Folder/readerton",
         new_rel_paths=new_articles,
