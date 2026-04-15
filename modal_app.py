@@ -91,31 +91,26 @@ def pcloud_auth(username: str, password: str) -> str:
     )
 
 
-def _collect_remote_files(metadata: dict, prefix: str, result: set) -> None:
-    """Recursively collect relative file paths from a listfolder metadata tree."""
-    for item in metadata.get("contents", []):
-        name = item["name"]
-        rel = f"{prefix}/{name}" if prefix else name
-        if item.get("isfolder", False):
-            _collect_remote_files(item, rel, result)
-        else:
-            result.add(rel)
+_ALWAYS_UPLOAD = {"index.html", "state.json", "removed_articles.json"}
 
 
-def pcloud_upload_folder(
+def pcloud_sync(
     auth: str,
     local_folder: str,
     remote_base_path: str,
+    new_rel_paths: list[str],
+    removed_rel_paths: set[str],
 ) -> None:
     """
-    Upload *local_folder* to *remote_base_path* on pCloud.
+    Sync local changes to pCloud.
 
-    - Files that already exist remotely are **skipped**.
-    - ``index.html``, ``state.json``, and ``removed_articles.json`` are **always overwritten**.
+    - Uploads *new_rel_paths* (paths relative to *local_folder*).
+    - Always re-uploads ``index.html``, ``state.json``, and ``removed_articles.json``.
+    - Deletes each path in *removed_rel_paths* from the remote.
     """
     import requests
 
-    # ---- Ensure destination folder exists --------------------------------
+    # Ensure base folder exists
     resp = requests.get(
         f"{PCLOUD_ENDPOINT}/createfolderifnotexists",
         params={"auth": auth, "path": remote_base_path},
@@ -123,90 +118,70 @@ def pcloud_upload_folder(
     )
     resp.raise_for_status()
     data = resp.json()
-    if data.get("result", 0) not in (0,):
+    if data.get("result", 0) != 0:
         raise RuntimeError(
             f"createfolderifnotexists failed for {remote_base_path}: {data}"
         )
-    logger.info("Remote folder ready: %s", remote_base_path)
 
-    # ---- List existing remote files (recursive) --------------------------
-    existing_files: set[str] = set()
-    resp = requests.get(
-        f"{PCLOUD_ENDPOINT}/listfolder",
-        params={"auth": auth, "path": remote_base_path, "recursive": 1},
-        timeout=60,
-    )
-    resp.raise_for_status()
-    data = resp.json()
-    if data.get("result", 0) == 0:
-        _collect_remote_files(data["metadata"], "", existing_files)
-        logger.info(
-            "Found %d existing files in %s", len(existing_files), remote_base_path
-        )
-    else:
-        logger.warning(
-            "listfolder returned result=%s – assuming empty", data.get("result")
-        )
-
-    # Files that must always be re-uploaded
-    ALWAYS_OVERWRITE = {"index.html", "state.json", "removed_articles.json"}
-
-    uploaded = 0
-    skipped = 0
-
-    for root, dirs, files in os.walk(local_folder):
-        rel_root = os.path.relpath(root, local_folder)
-        if rel_root == ".":
-            rel_root = ""
-
-        # Create sub-folders on the remote side
-        for d in dirs:
-            sub = (
-                f"{remote_base_path}/{rel_root}/{d}"
-                if rel_root
-                else f"{remote_base_path}/{d}"
-            )
-            resp = requests.get(
+    def _upload(rel_path: str) -> None:
+        local_path = os.path.join(local_folder, rel_path)
+        if not os.path.exists(local_path):
+            logger.warning("Local file missing, skipping upload: %s", rel_path)
+            return
+        subdir = os.path.dirname(rel_path)
+        remote_dir = f"{remote_base_path}/{subdir}" if subdir else remote_base_path
+        if subdir:
+            r = requests.get(
                 f"{PCLOUD_ENDPOINT}/createfolderifnotexists",
-                params={"auth": auth, "path": sub},
+                params={"auth": auth, "path": remote_dir},
                 timeout=30,
             )
-            resp.raise_for_status()
-            rdata = resp.json()
-            if rdata.get("result", 0) != 0:
-                logger.warning("Could not create remote folder %s: %s", sub, rdata)
-
-        # Upload files
-        for fname in files:
-            local_path = os.path.join(root, fname)
-            rel_file = f"{rel_root}/{fname}" if rel_root else fname
-
-            should_overwrite = fname in ALWAYS_OVERWRITE
-            if not should_overwrite and rel_file in existing_files:
-                skipped += 1
-                continue
-
-            remote_dir = (
-                f"{remote_base_path}/{rel_root}" if rel_root else remote_base_path
+            r.raise_for_status()
+        with open(local_path, "rb") as fh:
+            r = requests.post(
+                f"{PCLOUD_ENDPOINT}/uploadfile",
+                data={"auth": auth, "path": remote_dir},
+                files={"file": (os.path.basename(rel_path), fh)},
+                timeout=120,
             )
+        r.raise_for_status()
+        rdata = r.json()
+        if rdata.get("result", 0) != 0:
+            logger.error("uploadfile failed for %s: %s", rel_path, rdata)
+        else:
+            logger.info("Uploaded: %s", rel_path)
 
-            with open(local_path, "rb") as fh:
-                resp = requests.post(
-                    f"{PCLOUD_ENDPOINT}/uploadfile",
-                    data={"auth": auth, "path": remote_dir},
-                    files={"file": (fname, fh)},
-                    timeout=120,
-                )
-            resp.raise_for_status()
-            rdata = resp.json()
-            if rdata.get("result", 0) != 0:
-                logger.error("uploadfile failed for %s: %s", rel_file, rdata)
-            else:
-                uploaded += 1
-                logger.info("Uploaded: %s", rel_file)
+    # Upload new articles
+    for rel_path in new_rel_paths:
+        _upload(rel_path)
+
+    # Always re-upload metadata/index files
+    for fname in _ALWAYS_UPLOAD:
+        _upload(fname)
+
+    # Delete removed articles from pCloud
+    deleted = 0
+    for rel_path in removed_rel_paths:
+        remote_path = f"{remote_base_path}/{rel_path}"
+        r = requests.get(
+            f"{PCLOUD_ENDPOINT}/deletefile",
+            params={"auth": auth, "path": remote_path},
+            timeout=30,
+        )
+        r.raise_for_status()
+        rdata = r.json()
+        if rdata.get("result", 0) == 0:
+            deleted += 1
+            logger.info("Deleted: %s", rel_path)
+        elif rdata.get("result") == 2009:  # file not found – already gone
+            logger.debug("Already absent on remote: %s", rel_path)
+        else:
+            logger.error("deletefile failed for %s: %s", rel_path, rdata)
 
     logger.info(
-        "pCloud sync complete – uploaded %d, skipped %d existing", uploaded, skipped
+        "pCloud sync complete – %d new uploaded, %d removed deleted",
+        len(new_rel_paths),
+        deleted,
     )
 
 
@@ -285,7 +260,7 @@ def update():
     base_folder = _get_base_folder(readerton)
 
     # 1. Fetch new feed entries and generate article pages ----------------
-    readerton.process_feeds(
+    new_articles = readerton.process_feeds(
         feeds=feeds,
         base_folder=base_folder,
         index_url="../index.html",
@@ -305,11 +280,15 @@ def update():
     username = os.environ["PCLOUD_USERNAME"]
     password = os.environ["PCLOUD_PASSWORD"]
 
+    removed_articles = readerton.load_removed_articles(base_folder=base_folder)
+
     auth_token = pcloud_auth(username, password)
-    pcloud_upload_folder(
+    pcloud_sync(
         auth=auth_token,
         local_folder=base_folder,
         remote_base_path="/Public Folder/readerton",
+        new_rel_paths=new_articles,
+        removed_rel_paths=removed_articles,
     )
 
     logger.info("Readerton update complete.")

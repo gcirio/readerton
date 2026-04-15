@@ -1127,7 +1127,7 @@ def process_feeds(
     feeds: dict,
     base_folder: str = "articles",
     index_url: str = "../index.html",
-) -> None:
+) -> list[str]:
     """
     Main loop: parse feeds, check state, generate HTML pages for new entries,
     update state.
@@ -1140,7 +1140,13 @@ def process_feeds(
         Root directory where article sub-folders and state.json live.
     index_url:
         URL used in each article's "Back to index" link.
+
+    Returns
+    -------
+    list[str]:
+        Paths of newly created article files, each relative to ``base_folder``.
     """
+    new_articles: list[str] = []
     os.makedirs(base_folder, exist_ok=True)
 
     # State tracking
@@ -1245,6 +1251,9 @@ def process_feeds(
                     "New article: %s",
                     f"{domain_folder}/{os.path.basename(final_filename)}",
                 )
+                new_articles.append(
+                    os.path.relpath(final_filename, os.path.abspath(base_folder))
+                )
 
             except Exception as exc:
                 logger.exception(
@@ -1256,6 +1265,7 @@ def process_feeds(
                         os.remove(temp_filename)
                     except Exception:
                         pass
+
                 continue
 
     # Persist state – merge old + new to avoid forgetting previously seen entries
@@ -1265,6 +1275,8 @@ def process_feeds(
             json.dump(list(seen_ids_all), state_file)
     except Exception:
         pass
+
+    return new_articles
 
 
 def main() -> None:
