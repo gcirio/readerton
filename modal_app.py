@@ -49,31 +49,16 @@ image = (
 VOLUME_PATH = "/data"
 CONFIG_PATH = "/root/config.json"
 
-# Try EU first, then US.  Override with PCLOUD_API_HOST to skip auto-detection.
-PCLOUD_ENDPOINTS = [
-    "https://eapi.pcloud.com",  # Europe
-    "https://api.pcloud.com",  # United States
-]
+# Europe
+PCLOUD_ENDPOINT = "https://eapi.pcloud.com"
 
 logger = logging.getLogger("readerton.pcloud")
-
-# Resolved at auth time; used by all subsequent helpers.
-_active_api_base: str | None = None
 
 WEB_STATUS_QUERY_PARAM = "message"
 
 # ---------------------------------------------------------------------------
 # pCloud helpers
 # ---------------------------------------------------------------------------
-
-
-def _pcloud_api_base() -> str:
-    override = os.environ.get("PCLOUD_API_HOST", "").strip().rstrip("/")
-    if override:
-        return override
-    if _active_api_base:
-        return _active_api_base
-    return PCLOUD_ENDPOINTS[0]
 
 
 def _try_digest_auth(api: str, username: str, password: str) -> str | None:
@@ -167,33 +152,25 @@ def pcloud_digest_auth(username: str, password: str) -> str:
     """
     Authenticate with pCloud using digest authentication.
 
-    Tries both EU and US endpoints, and both SHA256 and SHA1 hashing,
-    to find the right combination automatically.
+    Tries both SHA256 and SHA1 hashing
 
     Returns an auth token valid for subsequent API calls.
-    Sets ``_active_api_base`` so all later helpers hit the correct server.
     """
-    global _active_api_base
-
-    override = os.environ.get("PCLOUD_API_HOST", "").strip().rstrip("/")
-    endpoints = [override] if override else list(PCLOUD_ENDPOINTS)
 
     errors: list[str] = []
-    for api in endpoints:
-        logger.info("Trying pCloud endpoint %s ...", api)
-        try:
-            token = _try_digest_auth(api, username, password)
-            if token:
-                _active_api_base = api
-                return token
-            errors.append(f"{api}: login failed (wrong credentials or server)")
-        except Exception as exc:
-            errors.append(f"{api}: {exc}")
-            logger.warning("pCloud auth error on %s: %s", api, exc)
+
+    logger.info("Trying pCloud endpoint %s ...", PCLOUD_ENDPOINT)
+    try:
+        token = _try_digest_auth(PCLOUD_ENDPOINT, username, password)
+        if token:
+            return token
+        errors.append(f"{PCLOUD_ENDPOINT}: login failed (wrong credentials or server)")
+    except Exception as exc:
+        errors.append(f"{PCLOUD_ENDPOINT}: {exc}")
+        logger.warning("pCloud auth error on %s: %s", PCLOUD_ENDPOINT, exc)
 
     raise RuntimeError(
-        "pCloud authentication failed on all endpoints. "
-        "Please verify PCLOUD_USERNAME and PCLOUD_PASSWORD are correct.\n"
+        "pCloud authentication failed. Please verify PCLOUD_USERNAME and PCLOUD_PASSWORD are correct.\n"
         + "\n".join(f"  - {e}" for e in errors)
     )
 
@@ -222,11 +199,9 @@ def pcloud_upload_folder(
     """
     import requests
 
-    api = _pcloud_api_base()
-
     # ---- Ensure destination folder exists --------------------------------
     resp = requests.get(
-        f"{api}/createfolderifnotexists",
+        f"{PCLOUD_ENDPOINT}/createfolderifnotexists",
         params={"auth": auth, "path": remote_base_path},
         timeout=30,
     )
@@ -241,7 +216,7 @@ def pcloud_upload_folder(
     # ---- List existing remote files (recursive) --------------------------
     existing_files: set[str] = set()
     resp = requests.get(
-        f"{api}/listfolder",
+        f"{PCLOUD_ENDPOINT}/listfolder",
         params={"auth": auth, "path": remote_base_path, "recursive": 1},
         timeout=60,
     )
@@ -276,7 +251,7 @@ def pcloud_upload_folder(
                 else f"{remote_base_path}/{d}"
             )
             resp = requests.get(
-                f"{api}/createfolderifnotexists",
+                f"{PCLOUD_ENDPOINT}/createfolderifnotexists",
                 params={"auth": auth, "path": sub},
                 timeout=30,
             )
@@ -301,7 +276,7 @@ def pcloud_upload_folder(
 
             with open(local_path, "rb") as fh:
                 resp = requests.post(
-                    f"{api}/uploadfile",
+                    f"{PCLOUD_ENDPOINT}/uploadfile",
                     data={"auth": auth, "path": remote_dir},
                     files={"file": (fname, fh)},
                     timeout=120,
