@@ -4,8 +4,7 @@ readerton/modal_app.py
 Modal scheduled job for Readerton.
 
 Processes RSS feeds, generates static HTML pages and an index, then uploads
-everything to pCloud (into /Public Folder/readerton) using digest
-authentication.
+everything to pCloud (into /Public Folder/readerton).
 
 The job runs daily at 9 PM Paris time.
 
@@ -18,7 +17,6 @@ Manual trigger
     modal run modal_app.py::update
 """
 
-import hashlib
 import logging
 import os
 from urllib.parse import quote_plus
@@ -61,117 +59,35 @@ WEB_STATUS_QUERY_PARAM = "message"
 # ---------------------------------------------------------------------------
 
 
-def _try_digest_auth(api: str, username: str, password: str) -> str | None:
+def pcloud_auth(username: str, password: str) -> str:
     """
-    Attempt digest auth against a single pCloud endpoint.
-
-    Tries SHA256 first, then SHA1.  Returns an auth token on success,
-    or ``None`` if login failed (result 2000).  Raises on unexpected errors.
-    """
-    import requests
-
-    # Step 1 – obtain a one-time digest
-    resp = requests.get(f"{api}/getdigest", timeout=30)
-    resp.raise_for_status()
-    data = resp.json()
-    if data.get("result", 0) != 0:
-        raise RuntimeError(f"getdigest failed on {api}: {data}")
-    digest = data["digest"]
-
-    # Step 2 – try SHA256 then SHA1 for the password digest
-    username_lower_bytes = username.lower().encode("utf-8")
-    password_bytes = password.encode("utf-8")
-    digest_bytes = digest.encode("utf-8")
-
-    candidates = []
-    for hash_fn in (hashlib.sha256, hashlib.sha1):
-        inner = hash_fn(username_lower_bytes).hexdigest().encode("utf-8")
-        pd = hash_fn(password_bytes + inner + digest_bytes).hexdigest()
-        candidates.append((hash_fn().name, pd))
-
-    for hash_name, password_digest in candidates:
-        # Need a fresh digest for each attempt (they are single-use / short-lived)
-        # but within the 30-second window we can reuse the same one.
-        resp = requests.get(
-            f"{api}/userinfo",
-            params={
-                "getauth": 1,
-                "logout": 1,
-                "username": username,
-                "digest": digest,
-                "passworddigest": password_digest,
-                "authexpire": 3600,
-            },
-            timeout=30,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-
-        if data.get("result", 0) == 0 and data.get("auth"):
-            logger.info(
-                "pCloud digest auth successful on %s using %s for %s",
-                api,
-                hash_name,
-                username,
-            )
-            return data["auth"]
-
-        # result 2000 = "Log in failed" → wrong hash or wrong server, try next
-        if data.get("result") == 2000:
-            logger.debug(
-                "Auth attempt failed on %s with %s (result 2000)", api, hash_name
-            )
-            # Fetch a fresh digest for the next attempt (previous may be consumed)
-            resp = requests.get(f"{api}/getdigest", timeout=30)
-            resp.raise_for_status()
-            ddata = resp.json()
-            if ddata.get("result", 0) != 0:
-                raise RuntimeError(f"getdigest failed on {api}: {ddata}")
-            digest = ddata["digest"]
-            digest_bytes = digest.encode("utf-8")
-            # Recompute remaining candidates with fresh digest
-            # (only matters if there's a next candidate)
-            remaining_idx = candidates.index((hash_name, password_digest)) + 1
-            for i in range(remaining_idx, len(candidates)):
-                h_name = candidates[i][0]
-                hfn = hashlib.sha256 if h_name == "sha256" else hashlib.sha1
-                inner = hfn(username_lower_bytes).hexdigest().encode("utf-8")
-                candidates[i] = (
-                    h_name,
-                    hfn(password_bytes + inner + digest_bytes).hexdigest(),
-                )
-            continue
-
-        # Any other error is unexpected
-        raise RuntimeError(f"pCloud auth unexpected response on {api}: {data}")
-
-    return None  # all attempts on this endpoint failed
-
-
-def pcloud_digest_auth(username: str, password: str) -> str:
-    """
-    Authenticate with pCloud using digest authentication.
-
-    Tries both SHA256 and SHA1 hashing
+    Authenticate with pCloud using username and password.
 
     Returns an auth token valid for subsequent API calls.
     """
+    import requests
 
-    errors: list[str] = []
+    resp = requests.get(
+        f"{PCLOUD_ENDPOINT}/userinfo",
+        params={
+            "getauth": 1,
+            "logout": 1,
+            "username": username,
+            "password": password,
+            "authexpire": 3600,
+        },
+        timeout=30,
+    )
+    resp.raise_for_status()
+    data = resp.json()
 
-    logger.info("Trying pCloud endpoint %s ...", PCLOUD_ENDPOINT)
-    try:
-        token = _try_digest_auth(PCLOUD_ENDPOINT, username, password)
-        if token:
-            return token
-        errors.append(f"{PCLOUD_ENDPOINT}: login failed (wrong credentials or server)")
-    except Exception as exc:
-        errors.append(f"{PCLOUD_ENDPOINT}: {exc}")
-        logger.warning("pCloud auth error on %s: %s", PCLOUD_ENDPOINT, exc)
+    if data.get("result", 0) == 0 and data.get("auth"):
+        logger.info("pCloud auth successful for %s", username)
+        return data["auth"]
 
     raise RuntimeError(
-        "pCloud authentication failed. Please verify PCLOUD_USERNAME and PCLOUD_PASSWORD are correct.\n"
-        + "\n".join(f"  - {e}" for e in errors)
+        f"pCloud authentication failed (result={data.get('result')}). "
+        "Please verify PCLOUD_USERNAME and PCLOUD_PASSWORD are correct."
     )
 
 
@@ -389,7 +305,7 @@ def update():
     username = os.environ["PCLOUD_USERNAME"]
     password = os.environ["PCLOUD_PASSWORD"]
 
-    auth_token = pcloud_digest_auth(username, password)
+    auth_token = pcloud_auth(username, password)
     pcloud_upload_folder(
         auth=auth_token,
         local_folder=base_folder,
