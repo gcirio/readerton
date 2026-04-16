@@ -17,7 +17,6 @@ Manual trigger
     modal run modal_app.py::update
 """
 
-import hashlib
 import logging
 import os
 from urllib.parse import quote_plus
@@ -63,11 +62,12 @@ WEB_STATUS_QUERY_PARAM = "message"
 def pcloud_open_session(username: str, password: str):
     """
     Open a keep-alive requests.Session and authenticate with pCloud using
-    digest authentication (SHA256 then SHA1).
+    SHA1 digest authentication.
 
     All subsequent calls on the returned session reuse the same connection
     and require no further credentials.
     """
+    import hashlib
     import requests
 
     session = requests.Session()
@@ -75,7 +75,7 @@ def pcloud_open_session(username: str, password: str):
     username_lower_bytes = username.lower().encode("utf-8")
     password_bytes = password.encode("utf-8")
 
-    # Fetch initial digest
+    # Fetch digest
     resp = session.get(f"{PCLOUD_ENDPOINT}/getdigest", timeout=30)
     resp.raise_for_status()
     data = resp.json()
@@ -83,47 +83,29 @@ def pcloud_open_session(username: str, password: str):
         raise RuntimeError(f"getdigest failed: {data}")
     digest = data["digest"]
 
-    for hash_fn in (hashlib.sha256, hashlib.sha1):
-        digest_bytes = digest.encode("utf-8")
-        inner = hash_fn(username_lower_bytes).hexdigest().encode("utf-8")
-        password_digest = hash_fn(password_bytes + inner + digest_bytes).hexdigest()
+    digest_bytes = digest.encode("utf-8")
+    inner = hashlib.sha1(username_lower_bytes).hexdigest().encode("utf-8")
+    password_digest = hashlib.sha1(password_bytes + inner + digest_bytes).hexdigest()
 
-        resp = session.get(
-            f"{PCLOUD_ENDPOINT}/userinfo",
-            params={
-                "getauth": 1,
-                "logout": 1,
-                "username": username,
-                "digest": digest,
-                "passworddigest": password_digest,
-            },
-            timeout=30,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-
-        if data.get("result", 0) == 0:
-            logger.info(
-                "pCloud digest auth successful (%s) for %s", hash_fn().name, username
-            )
-            return session
-
-        if data.get("result") == 2000:
-            # Fetch a fresh digest for the next attempt
-            resp = session.get(f"{PCLOUD_ENDPOINT}/getdigest", timeout=30)
-            resp.raise_for_status()
-            ddata = resp.json()
-            if ddata.get("result", 0) != 0:
-                raise RuntimeError(f"getdigest failed: {ddata}")
-            digest = ddata["digest"]
-            continue
-
-        raise RuntimeError(f"pCloud auth unexpected response: {data}")
-
-    raise RuntimeError(
-        "pCloud digest authentication failed. "
-        "Please verify PCLOUD_USERNAME and PCLOUD_PASSWORD are correct."
+    resp = session.get(
+        f"{PCLOUD_ENDPOINT}/userinfo",
+        params={
+            "getauth": 1,
+            "logout": 1,
+            "username": username,
+            "digest": digest,
+            "passworddigest": password_digest,
+        },
+        timeout=30,
     )
+    resp.raise_for_status()
+    data = resp.json()
+
+    if data.get("result", 0) != 0:
+        raise RuntimeError(f"pCloud auth failed: {data}")
+
+    logger.info("pCloud digest auth successful for %s", username)
+    return session
 
 
 _ALWAYS_UPLOAD = {"index.html", "state.json", "removed_articles.json"}
