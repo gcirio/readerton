@@ -68,9 +68,19 @@ def pcloud_open_session(username: str, password: str):
     and require no further credentials.
     """
     import hashlib
+
     import requests
+    from requests.adapters import HTTPAdapter
+    from urllib3.util.retry import Retry
 
     session = requests.Session()
+    retries = Retry(
+        total=3,
+        backoff_factor=1,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=frozenset({"GET"}),
+        raise_on_status=False,
+    )
 
     username_lower_bytes = username.lower().encode("utf-8")
     password_bytes = password.encode("utf-8")
@@ -104,6 +114,7 @@ def pcloud_open_session(username: str, password: str):
     if data.get("result", 0) != 0:
         raise RuntimeError(f"pCloud auth failed: {data}")
 
+    session.mount(PCLOUD_ENDPOINT, HTTPAdapter(max_retries=retries))
     logger.info("pCloud digest auth successful for %s", username)
     return session
 
@@ -125,6 +136,8 @@ def pcloud_sync(
     - Always re-uploads ``index.html``, ``state.json``, and ``removed_articles.json``.
     - Deletes each path in *removed_rel_paths* from the remote.
     """
+    import requests
+
     # Ensure base folder exists
     resp = session.get(
         f"{PCLOUD_ENDPOINT}/createfolderifnotexists",
@@ -178,12 +191,20 @@ def pcloud_sync(
     deleted = 0
     for rel_path in removed_rel_paths:
         remote_path = f"{remote_base_path}/{rel_path}"
-        r = session.get(
-            f"{PCLOUD_ENDPOINT}/deletefile",
-            params={"path": remote_path},
-            timeout=30,
-        )
-        r.raise_for_status()
+        try:
+            r = session.get(
+                f"{PCLOUD_ENDPOINT}/deletefile",
+                params={"path": remote_path},
+                timeout=30,
+            )
+            r.raise_for_status()
+        except requests.exceptions.Timeout as exc:
+            logger.warning(
+                "Timed out deleting %s after retries; will retry next run: %s",
+                rel_path,
+                exc,
+            )
+            continue
         rdata = r.json()
         if rdata.get("result", 0) == 0:
             deleted += 1
