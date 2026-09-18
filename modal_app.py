@@ -81,6 +81,7 @@ def pcloud_open_session(username: str, password: str):
         allowed_methods=frozenset({"GET"}),
         raise_on_status=False,
     )
+    session.mount(PCLOUD_ENDPOINT, HTTPAdapter(max_retries=retries))
 
     username_lower_bytes = username.lower().encode("utf-8")
     password_bytes = password.encode("utf-8")
@@ -114,12 +115,20 @@ def pcloud_open_session(username: str, password: str):
     if data.get("result", 0) != 0:
         raise RuntimeError(f"pCloud auth failed: {data}")
 
-    session.mount(PCLOUD_ENDPOINT, HTTPAdapter(max_retries=retries))
     logger.info("pCloud digest auth successful for %s", username)
     return session
 
 
 _ALWAYS_UPLOAD = {"index.html", "state.json", "removed_articles.json"}
+
+
+def _collect_remote_files(metadata: dict, prefix: str, result: set[str]) -> None:
+    for item in metadata.get("contents", []):
+        rel_path = f"{prefix}/{item['name']}" if prefix else item["name"]
+        if item.get("isfolder", False):
+            _collect_remote_files(item, rel_path, result)
+        else:
+            result.add(rel_path)
 
 
 def pcloud_sync(
@@ -132,7 +141,7 @@ def pcloud_sync(
     """
     Sync local changes to pCloud over an already-authenticated session.
 
-    - Uploads *new_rel_paths* (paths relative to *local_folder*).
+    - Uploads *new_rel_paths* and local HTML files missing remotely.
     - Always re-uploads ``index.html``, ``state.json``, and ``removed_articles.json``.
     - Deletes each path in *removed_rel_paths* from the remote.
     """
@@ -151,11 +160,48 @@ def pcloud_sync(
             f"createfolderifnotexists failed for {remote_base_path}: {data}"
         )
 
-    def _upload(rel_path: str) -> None:
+    resp = session.get(
+        f"{PCLOUD_ENDPOINT}/listfolder",
+        params={"path": remote_base_path, "recursive": 1},
+        timeout=60,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    if data.get("result", 0) != 0:
+        raise RuntimeError(f"listfolder failed for {remote_base_path}: {data}")
+
+    remote_files: set[str] = set()
+    _collect_remote_files(data["metadata"], "", remote_files)
+    new_rel_path_set = set(new_rel_paths)
+    recovered_rel_paths: list[str] = []
+    for root, _, files in os.walk(local_folder):
+        for filename in files:
+            if not filename.endswith(".html"):
+                continue
+            rel_path = os.path.relpath(
+                os.path.join(root, filename), local_folder
+            ).replace("\\", "/")
+            if (
+                rel_path != "index.html"
+                and rel_path not in remote_files
+                and rel_path not in removed_rel_paths
+                and rel_path not in new_rel_path_set
+            ):
+                recovered_rel_paths.append(rel_path)
+    recovered_rel_paths.sort()
+    if recovered_rel_paths:
+        logger.warning(
+            "Recovering %d local articles missing from pCloud",
+            len(recovered_rel_paths),
+        )
+
+    article_rel_paths = list(dict.fromkeys([*new_rel_paths, *recovered_rel_paths]))
+
+    def _upload(rel_path: str) -> bool:
         local_path = os.path.join(local_folder, rel_path)
         if not os.path.exists(local_path):
             logger.warning("Local file missing, skipping upload: %s", rel_path)
-            return
+            return False
         subdir = os.path.dirname(rel_path)
         remote_dir = f"{remote_base_path}/{subdir}" if subdir else remote_base_path
         if subdir:
@@ -165,6 +211,11 @@ def pcloud_sync(
                 timeout=30,
             )
             r.raise_for_status()
+            rdata = r.json()
+            if rdata.get("result", 0) != 0:
+                raise RuntimeError(
+                    f"createfolderifnotexists failed for {remote_dir}: {rdata}"
+                )
         with open(local_path, "rb") as fh:
             r = session.post(
                 f"{PCLOUD_ENDPOINT}/uploadfile",
@@ -175,13 +226,11 @@ def pcloud_sync(
         r.raise_for_status()
         rdata = r.json()
         if rdata.get("result", 0) != 0:
-            logger.error("uploadfile failed for %s: %s", rel_path, rdata)
-        else:
-            logger.info("Uploaded: %s", rel_path)
+            raise RuntimeError(f"uploadfile failed for {rel_path}: {rdata}")
+        logger.info("Uploaded: %s", rel_path)
+        return True
 
-    # Upload new articles
-    for rel_path in new_rel_paths:
-        _upload(rel_path)
+    uploaded = sum(_upload(rel_path) for rel_path in article_rel_paths)
 
     # Always re-upload metadata/index files
     for fname in _ALWAYS_UPLOAD:
@@ -215,8 +264,8 @@ def pcloud_sync(
             logger.error("deletefile failed for %s: %s", rel_path, rdata)
 
     logger.info(
-        "pCloud sync complete – %d new uploaded, %d removed deleted",
-        len(new_rel_paths),
+        "pCloud sync complete – %d articles uploaded, %d removed deleted",
+        uploaded,
         deleted,
     )
 
